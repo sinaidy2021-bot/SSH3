@@ -1,11 +1,11 @@
 name: iOS 构建
 
 on:
-  workflow_dispatch:  # 只有手动点击才会构建，改文件不会乱跑
+  workflow_dispatch:  # 只有手动点击才会构建
 
 jobs:
   build:
-    runs-on: macos-15   # 👈 关键修复：使用最新的 macOS 15，自带 Xcode 16，完美兼容新格式
+    runs-on: macos-15
 
     steps:
       - name: 拉取代码
@@ -26,18 +26,30 @@ jobs:
           xcodebuild -version
           
           echo "👉 开始编译（如果报错，下方会出现中文提示）..."
+          
+          # 临时关掉“遇错即停”，把日志写到文件里
+          set +e
           xcodebuild \
             -project SSHBlack.xcodeproj \
             -scheme SSHBlack \
             -configuration Release \
             -sdk iphonesimulator \
             -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO
-            
-          if [ $? -eq 0 ]; then
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO > build_log.txt 2>&1
+          EXIT_CODE=$?
+          set -e
+          
+          # 把完整日志打印出来
+          cat build_log.txt
+          
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "🎉 构建成功！"
           else
             echo "❌ 构建失败！请截图上面的英文报错发给助手。"
+            echo "👉 错误摘要："
+            grep -i "error:" build_log.txt | tail -n 10
             exit 1
           fi
 
