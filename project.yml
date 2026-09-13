@@ -12,7 +12,7 @@ packages:
     from: "2.65.0"
   swift-nio-ssh:
     url: https://github.com/apple/swift-nio-ssh.git
-    from: "1.0.0"
+    from: "0.15.0"   # 👈 关键修复：这个库最高只有 0.x 版本，没有 1.0.0
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm.git
     from: "1.2.0"
