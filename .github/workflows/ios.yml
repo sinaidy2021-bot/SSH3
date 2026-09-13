@@ -1,0 +1,37 @@
+name: iOS 构建
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 XcodeGen
+        run: brew install xcodegen
+
+      - name: 生成 Xcode 工程
+        run: xcodegen generate
+
+      - name: 构建模拟器版本
+        run: |
+          xcodebuild \
+            -project SSHBlack.xcodeproj \
+            -scheme SSHBlack \
+            -configuration Release \
+            -sdk iphonesimulator \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSHBlack-模拟器版
+          path: build/Build/Products/Release-iphonesimulator/SSHBlack.app
