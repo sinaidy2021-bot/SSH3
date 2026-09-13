@@ -5,6 +5,7 @@ options:
   deploymentTarget:
     iOS: "16.0"
   createIntermediateGroups: true
+  objectVersion: 56  # 强制使用 Xcode 15 兼容的项目格式，解决 format (77) 报错
 
 packages:
   swift-nio:
