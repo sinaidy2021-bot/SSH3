@@ -1,10 +1,7 @@
 name: iOS 构建
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-  workflow_dispatch:
+  workflow_dispatch:  # 👈 只保留这一行，代表只能去网页上手动点按钮构建
 
 jobs:
   build:
@@ -14,7 +11,7 @@ jobs:
       - name: 拉取代码
         uses: actions/checkout@v4
 
-      - name: 选择 Xcode 15.4  # 👈 关键修复：强制使用旧版 Xcode
+      - name: 选择 Xcode 15.4
         run: sudo xcode-select -s /Applications/Xcode_15.4.app
 
       - name: 安装 XcodeGen
