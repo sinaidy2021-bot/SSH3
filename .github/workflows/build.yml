@@ -5,18 +5,53 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: Select Xcode 16
-        run: sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer || sudo xcode-select -s /Applications/Xcode_16.1.app/Contents/Developer || sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
-      - run: brew install xcodegen
-      - run: xcodegen generate
-      - name: Build
+
+      - name: 1. 选择Xcode
         run: |
-          xcodebuild -project MySSH.xcodeproj -scheme MySSH -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+          echo "=== 正在选择 Xcode 16 ==="
+          sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer || sudo xcode-select -s /Applications/Xcode_16.1.app/Contents/Developer || ls /Applications/
+          xcodebuild -version
+
+      - name: 2. 安装工具
+        run: |
+          echo "=== 正在安装 xcodegen ==="
+          brew install xcodegen
+          xcodegen --version
+
+      - name: 3. 生成工程
+        run: |
+          echo "=== 正在生成 MySSH.xcodeproj ==="
+          xcodegen generate
+          ls -lh
+
+      - name: 4. 开始编译并记录中文日记
+        run: |
+          echo "=== 开始编译 IPA，全部日志将写入 build.log ==="
+          set -o pipefail
+          xcodebuild -project MySSH.xcodeproj -scheme MySSH -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" 2>&1 | tee build.log
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "❌ 编译失败！请查看上方日志或下载 build.log"
+            echo "常见原因："
+            echo "1. project format 77 -> 请确认 runner 是 macos-15"
+            echo "2. 找不到 Citadel -> 检查网络"
+            echo "3. Swift 语法错误 -> 查看 log 最后 50 行"
+            exit 1
+          fi
+          echo "✅ 编译成功，正在打包 IPA"
           mkdir -p Payload
           cp -r build/Build/Products/Release-iphoneos/MySSH.app Payload/
           zip -r MySSH.ipa Payload
-      - uses: actions/upload-artifact@v4
+
+      - name: 5. 上传中文日记
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-中文日记
+          path: build.log
+
+      - name: 6. 上传IPA成品
         if: success()
+        uses: actions/upload-artifact@v4
         with:
           name: MySSH-ipa
           path: MySSH.ipa
