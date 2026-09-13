@@ -2,14 +2,14 @@ name: Build iOS IPA
 on: [workflow_dispatch]
 jobs:
   build:
-    runs-on: macos-17
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - run: brew install xcodegen
       - run: xcodegen generate
       - name: Build
         run: |
-          xcodebuild -project MySSH.xcodeproj -scheme MySSH -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO
+          xcodebuild -project MySSH.xcodeproj -scheme MySSH -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
           mkdir -p Payload
           cp -r build/Build/Products/Release-iphoneos/MySSH.app Payload/
           zip -r MySSH.ipa Payload
