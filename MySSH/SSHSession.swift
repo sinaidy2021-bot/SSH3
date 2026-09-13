@@ -3,75 +3,76 @@ import Citadel
 import Combine
 
 struct HistoryItem: Identifiable {
-    var id = UUID()
-    var command: String
-    var output: String
+  var id = UUID()
+  var command: String
+  var output: String
 }
 
 class SSHSession: ObservableObject {
-    @Published var history: [HistoryItem] = []
-    @Published var isConnected = false
-    var host = ""
-    var username = ""
-    var password = ""
-    private var client: SSHClient?
-    private var shell: SSHChannel?
+  @Published var history: [HistoryItem] = []
+  @Published var isConnected = false
+  var host = ""
+  var username = ""
+  var password = ""
+  private var client: SSHClient?
 
-    func connect() {
-        Task {
-            do {
-                let client = try await SSHClient.connect(
-                    host: host,
-                    username: username,
-                    authMethod: SSHAuthMethod.password(password),
-                    hostValidator:.acceptAnything()
-                )
-                await MainActor.run { self.isConnected = true }
-                self.client = client
-                let shell = try await client.openShell()
-                self.shell = shell
-                for try await data in shell.outputs {
-                    if let text = String(data: data, encoding:.utf8) {
-                        let clean = text.trimmingCharacters(in:.whitespacesAndNewlines)
-                        if!clean.isEmpty {
-                            await MainActor.run {
-                                if self.history.isEmpty {
-                                    self.history.append(HistoryItem(command: "连接成功", output: clean))
-                                } else {
-                                    self.history[self.history.count - 1].output += clean + "\n"
-                                }
-                            }
-                        }
-                    }
-                }
-            } catch {
-                await MainActor.run {
-                    self.history.append(HistoryItem(command: "连接失败", output: "\(error)"))
-                }
-            }
+  func connect() {
+    Task {
+      do {
+        let settings = SSHClientSettings(
+          host: host,
+          authenticationMethod: {.passwordBased(username: self.username, password: self.password) },
+          hostKeyValidator:.acceptAnything(),
+          reconnect:.never
+        )
+        let client = try await SSHClient.connect(to: settings)
+        self.client = client
+        await MainActor.run {
+          self.isConnected = true
+          self.history.append(HistoryItem(command: "连接成功", output: "已连接到 \(self.host)"))
         }
+      } catch {
+        await MainActor.run {
+          self.history.append(HistoryItem(command: "连接失败", output: "\(error)"))
+        }
+      }
     }
+  }
 
-    func sendCommand(_ cmd: String) {
-        DispatchQueue.main.async {
-            self.history.append(HistoryItem(command: cmd, output: ""))
-        }
-        Task {
-            try? await self.shell?.write((cmd + "\n").data(using:.utf8)?? Data())
-        }
+  func sendCommand(_ cmd: String) {
+    let trimmed = cmd.trimmingCharacters(in:.whitespacesAndNewlines)
+    if trimmed.isEmpty { return }
+    DispatchQueue.main.async {
+      self.history.append(HistoryItem(command: trimmed, output: "执行中..."))
     }
+    Task {
+      do {
+        guard let client = self.client else { return }
+        let output = try await client.executeCommand(trimmed)
+        let text = String(buffer: output)
+        let clean = text.trimmingCharacters(in:.whitespacesAndNewlines)
+        await MainActor.run {
+          if!clean.isEmpty {
+            let idx = self.history.count - 1
+            if idx >= 0 { self.history[idx].output = clean }
+          } else {
+            let idx = self.history.count - 1
+            if idx >= 0 { self.history[idx].output = "(无输出)" }
+          }
+        }
+      } catch {
+        await MainActor.run {
+          let idx = self.history.count - 1
+          if idx >= 0 { self.history[idx].output = "错误: \(error)" }
+        }
+      }
+    }
+  }
 
-    func sendCtrlC() {
-        Task { try? await self.shell?.write(Data([0x03])) }
-    }
-    func sendTab() {
-        Task { try? await self.shell?.write(Data([0x09])) }
-    }
-    func disconnect() {
-        Task {
-            try? await self.shell?.close()
-            try? await self.client?.close()
-        }
-        DispatchQueue.main.async { self.isConnected = false }
-    }
+  func sendCtrlC() {}
+  func sendTab() {}
+  func disconnect() {
+    Task { try? await self.client?.close() }
+    DispatchQueue.main.async { self.isConnected = false }
+  }
 }
