@@ -13,29 +13,11 @@ jobs:
       - run: xcodegen generate
       - name: Build
         run: |
-          set +e
           set -o pipefail
           xcodebuild -project MySSH.xcodeproj -target MySSH -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" 2>&1 | tee build.log
-          echo "" | tee -a build.log
-          echo "========================================" | tee -a build.log
-          echo "🔍 共发现 $(grep -c "error:" build.log) 条报错，逐条列出（含上下文和建议方案）" | tee -a build.log
-          echo "========================================" | tee -a build.log
-          grep -n "error:" build.log | head -20 | while read line; do
-            echo "" | tee -a build.log
-            echo "----------------------------------------" | tee -a build.log
-            echo "📍 报错内容：" | tee -a build.log
-            echo "$line" | tee -a build.log
-            echo "" | tee -a build.log
-            echo "💡 建议：把这条报错完整内容发给我，我可以帮你定位具体是哪一行代码的问题。" | tee -a build.log
-          done
-          echo "" | tee -a build.log
-          if grep -q "BUILD FAILED" build.log; then
-            echo "** BUILD FAILED **" | tee -a build.log
-            exit 1
-          fi
           mkdir -p Payload
           cp -r build/Build/Products/Release-iphoneos/MySSH.app Payload/
-          zip -r MySSH.ipa Payload
+          zip -qr MySSH.ipa Payload -x "*.DS_Store"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
