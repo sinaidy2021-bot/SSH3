@@ -9,11 +9,18 @@ jobs:
       - run: xcodegen generate
       - name: Build
         run: |
-          xcodebuild -project MySSH.xcodeproj -scheme MySSH -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+          set -o pipefail
+          xcodebuild -project MySSH.xcodeproj -scheme MySSH -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" 2>&1 | tee build.log
           mkdir -p Payload
           cp -r build/Build/Products/Release-iphoneos/MySSH.app Payload/
           zip -r MySSH.ipa Payload
       - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: build.log
+      - uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: MySSH-ipa
           path: MySSH.ipa
