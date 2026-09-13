@@ -1,21 +1,25 @@
 name: MySSH
 options:
   bundleIdPrefix: com.myssh
+  xcodeVersion: "16.0"
 targets:
   MySSH:
     type: application
     platform: iOS
     deploymentTarget: "16.0"
     sources: [MySSH]
+    info:
+      path: MySSH/Info.plist
+      properties: {}
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.myssh.app
+        SWIFT_VERSION: "5.0"
         INFOPLIST_FILE: MySSH/Info.plist
+        CODE_SIGNING_ALLOWED: NO
     dependencies:
       - package: Citadel
-      - package: NIOSSH
-      - package: NIO
 packages:
-  Citadel: { url: https://github.com/orlandos-nl/Citadel, from: "0.9.0" }
-  NIOSSH: { url: https://github.com/apple/swift-nio-ssh, from: "0.8.0" }
-  NIO: { url: https://github.com/apple/swift-nio, from: "2.70.0" }
+  Citadel:
+    url: https://github.com/orlandos-nl/Citadel
+    from: "0.9.0"
