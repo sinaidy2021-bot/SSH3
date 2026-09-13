@@ -21,7 +21,7 @@ class SSHSession: ObservableObject {
       do {
         let settings = SSHClientSettings(
           host: host,
-          authenticationMethod: {.passwordBased(username: self.username, password: self.password) },
+          authenticationMethod:.passwordBased(username: self.username, password: self.password),
           hostKeyValidator:.acceptAnything(),
           reconnect:.never
         )
@@ -60,19 +60,4 @@ class SSHSession: ObservableObject {
             if idx >= 0 { self.history[idx].output = "(无输出)" }
           }
         }
-      } catch {
-        await MainActor.run {
-          let idx = self.history.count - 1
-          if idx >= 0 { self.history[idx].output = "错误: \(error)" }
-        }
       }
-    }
-  }
-
-  func sendCtrlC() {}
-  func sendTab() {}
-  func disconnect() {
-    Task { try? await self.client?.close() }
-    DispatchQueue.main.async { self.isConnected = false }
-  }
-}
