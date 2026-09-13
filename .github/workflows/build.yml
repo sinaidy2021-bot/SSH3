@@ -14,9 +14,12 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          xcodebuild -project MySSH.xcodeproj -target MySSH -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" 2>&1 | tee build.log
+          xcodebuild -project MySSH.xcodeproj -scheme MySSH -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" 2>&1 | tee build.log
           mkdir -p Payload
-          cp -r build/Build/Products/Release-iphoneos/MySSH.app Payload/
+          APP_PATH=$(find ~/Library/Developer/Xcode/DerivedData -name "MySSH.app" -type d | head -n 1)
+          echo "APP at $APP_PATH" | tee -a build.log
+          cp -r "$APP_PATH" Payload/
+          rm -rf Payload/MySSH.app/_CodeSignature || true
           zip -qr MySSH.ipa Payload -x "*.DS_Store"
       - uses: actions/upload-artifact@v4
         if: always()
