@@ -1,25 +1,58 @@
-name: MySSH
+name: SSHBlack
+
 options:
-  bundleIdPrefix: com.myssh
-  xcodeVersion: "16.0"
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+packages:
+  swift-nio:
+    url: https://github.com/apple/swift-nio.git
+    from: "2.65.0"
+  swift-nio-ssh:
+    url: https://github.com/apple/swift-nio-ssh.git
+    from: "1.0.0"
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm.git
+    from: "1.2.0"
+
 targets:
-  MySSH:
+  SSHBlack:
     type: application
     platform: iOS
-    deploymentTarget: "16.0"
-    sources: [MySSH]
-    info:
-      path: MySSH/Info.plist
-      properties: {}
+    sources:
+      - Sources/SSHBlack
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.myssh.app
-        SWIFT_VERSION: "5.0"
-        INFOPLIST_FILE: MySSH/Info.plist
-        CODE_SIGNING_ALLOWED: NO
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.sshblack
+        PRODUCT_NAME: SSHBlack
+        SWIFT_VERSION: "5.9"
+        SWIFT_STRICT_CONCURRENCY: minimal
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_CFBundleDisplayName: "SSH Black"
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
+        INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
+        INFOPLIST_KEY_UIStatusBarStyle: "UIStatusBarStyleLightContent"
+        INFOPLIST_KEY_UIUserInterfaceStyle: "Dark"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        TARGETED_DEVICE_FAMILY: "1,2"
     dependencies:
-      - package: Citadel
-packages:
-  Citadel:
-    url: https://github.com/orlandos-nl/Citadel
-    from: "0.9.0"
+      - package: swift-nio-ssh
+        product: NIOSSH
+      - package: swift-nio
+        product: NIOCore
+      - package: swift-nio
+        product: NIOPosix
+      - package: SwiftTerm
+        product: SwiftTerm
+
+schemes:
+  SSHBlack:
+    build:
+      targets:
+        SSHBlack: all
+    run:
+      config: Debug
+    archive:
+      config: Release
