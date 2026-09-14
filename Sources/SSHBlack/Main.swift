@@ -275,47 +275,6 @@ struct TerminalViewWrapper: UIViewRepresentable {
     func updateUIView(_ uiView: TerminalView, context: Context) {}
 }
 
-// MARK: - 快捷键栏
-struct QuickKeyBar: View {
-    let onKey: (TerminalKey) -> Void
-    var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(TerminalKey.allCases, id: \.self) { key in
-                    Button {
-                        onKey(key)
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    } label: {
-                        Text(key.label).font(.system(.footnote, design: .monospaced).weight(.medium))
-                            .foregroundColor(Theme.neon).padding(.horizontal, 12).padding(.vertical, 8)
-                            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Theme.neonSoft).overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Theme.neon.opacity(0.35), lineWidth: 1)))
-                    }.buttonStyle(.plain)
-                }
-            }.padding(.horizontal, 12).padding(.vertical, 8)
-        }
-        .background(Color.black.opacity(0.6))
-        .overlay(Rectangle().frame(height: 1).foregroundColor(Theme.stroke), alignment: .top)
-    }
-}
-
-enum TerminalKey: CaseIterable {
-    case esc, tab, ctrlC, ctrlD, ctrlL, ctrlZ, arrowUp, arrowDown, arrowLeft, arrowRight, pipe, tilde, slash, dash, star, dollar
-    var label: String {
-        switch self {
-        case .esc: return "Esc"; case .tab: return "Tab"; case .ctrlC: return "^C"; case .ctrlD: return "^D"; case .ctrlL: return "^L"; case .ctrlZ: return "^Z"
-        case .arrowUp: return "↑"; case .arrowDown: return "↓"; case .arrowLeft: return "←"; case .arrowRight: return "→"
-        case .pipe: return "|"; case .tilde: return "~"; case .slash: return "/"; case .dash: return "-"; case .star: return "*"; case .dollar: return "$"
-        }
-    }
-    var bytes: Data {
-        switch self {
-        case .esc: return Data([0x1B]); case .tab: return Data([0x09]); case .ctrlC: return Data([0x03]); case .ctrlD: return Data([0x04]); case .ctrlL: return Data([0x0C]); case .ctrlZ: return Data([0x1A])
-        case .arrowUp: return Data([0x1B, 0x5B, 0x41]); case .arrowDown: return Data([0x1B, 0x5B, 0x42]); case .arrowRight: return Data([0x1B, 0x5B, 0x43]); case .arrowLeft: return Data([0x1B, 0x5B, 0x44])
-        case .pipe: return Data("|".utf8); case .tilde: return Data("~".utf8); case .slash: return Data("/".utf8); case .dash: return Data("-".utf8); case .star: return Data("*".utf8); case .dollar: return Data("$".utf8)
-        }
-    }
-}
-
 // MARK: - 界面
 struct RootView: View {
     var body: some View { NavigationStack { SessionListView() }.tint(Theme.neon) }
@@ -459,17 +418,46 @@ struct TerminalScreen: View {
     @State private var toast: String?
     @State private var showBufferSheet = false
     @State private var bufferLines: [String] = []
+    @State private var showSystemKeyboard = false
     
     var body: some View {
         ZStack {
             Theme.bg.ignoresSafeArea()
-            VStack(spacing: 0) { statusBar; terminalArea; bottomToolbar; QuickKeyBar { key in ssh.send(key.bytes) } }
+            VStack(spacing: 0) {
+                statusBar
+                terminalArea
+                if !showSystemKeyboard {
+                    CustomKeyPanel(
+                        onKey: { key in ssh.send(key.bytes) },
+                        onText: { text in ssh.sendText(text) },
+                        onToggleKeyboard: { toggleKeyboard() }
+                    )
+                }
+            }
         }
         .navigationBarBackButtonHidden(true).toolbar(.hidden, for: .navigationBar).overlay(alignment: .top) { toastView }
-        .sheet(isPresented: $showBufferSheet) { BufferSheet(lines: bufferLines) { text in copy(text, tip: "已复制该行") }.presentationDetents([.medium, .large]).presentationDragIndicator(.visible) }
-        .task { let pw = KeychainHelper.read(account: "session.\(session.id.uuidString).password") ?? ""; await ssh.connect(session: session, password: pw) }
+        .sheet(isPresented: $showBufferSheet) {
+            BufferSheet(lines: bufferLines) { text in copy(text, tip: "已复制该行") }
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
+        .task {
+            let pw = KeychainHelper.read(account: "session.\(session.id.uuidString).password") ?? ""
+            await ssh.connect(session: session, password: pw)
+        }
         .onDisappear { Task { await ssh.disconnect() } }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in showSystemKeyboard = true }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in showSystemKeyboard = false }
     }
+
+    private func toggleKeyboard() {
+        if showSystemKeyboard {
+            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        } else {
+            UIApplication.shared.sendAction(#selector(UIResponder.becomeFirstResponder), to: nil, from: nil, for: nil)
+        }
+    }
+
     private var statusBar: some View {
         HStack(spacing: 10) {
             Button { Task { await ssh.disconnect(); dismiss() } } label: { Image(systemName: "chevron.left").font(.system(size: 16, weight: .bold)).foregroundColor(Theme.neon).padding(8).background(Circle().fill(Theme.neonSoft)) }
@@ -479,32 +467,16 @@ struct TerminalScreen: View {
                 Text(ssh.statusText).font(.caption2.monospaced()).foregroundColor(Theme.textDim).lineLimit(1).truncationMode(.middle)
             }
             Spacer()
-            Button { collectBufferAndOpen() } label: { Image(systemName: "list.bullet.rectangle").font(.system(size: 15, weight: .semibold)).foregroundColor(Theme.neon).padding(8).background(Circle().fill(Theme.neonSoft)) }
+            // 右上角：打开日志面板，支持单行/任意复制
+            Button { collectBufferAndOpen() } label: { Image(systemName: "doc.text.magnifyingglass").font(.system(size: 15, weight: .semibold)).foregroundColor(Theme.neon).padding(8).background(Circle().fill(Theme.neonSoft)) }
         }
         .padding(.horizontal, 12).padding(.vertical, 10)
         .background(LinearGradient(colors: [Color.black.opacity(0.95), Color.black.opacity(0.7)], startPoint: .top, endPoint: .bottom))
         .overlay(Rectangle().frame(height: 1).foregroundColor(Theme.stroke), alignment: .bottom)
     }
+
     private var terminalArea: some View { TerminalViewWrapper(ssh: ssh, bridge: bridge).background(Theme.bg) }
-    private var bottomToolbar: some View {
-        HStack(spacing: 10) {
-            toolButton(icon: "doc.on.doc.fill", title: "复制屏幕", tint: Theme.neon) { copyScreen() }
-            toolButton(icon: "doc.on.clipboard", title: "粘贴", tint: Theme.violet) { pasteFromClipboard() }
-            toolButton(icon: "eraser.fill", title: "清屏", tint: Theme.magenta) { ssh.send(Data([0x0C])) }
-            Spacer()
-            toolButton(icon: "keyboard", title: "键盘", tint: Theme.neon) { UIApplication.shared.sendAction(#selector(UIResponder.becomeFirstResponder), to: nil, from: nil, for: nil) }
-        }
-        .padding(.horizontal, 12).padding(.vertical, 8)
-        .background(Color.black.opacity(0.85))
-        .overlay(Rectangle().frame(height: 1).foregroundColor(Theme.stroke), alignment: .top)
-    }
-    private func toolButton(icon: String, title: String, tint: Color, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 6) { Image(systemName: icon).font(.system(size: 13, weight: .semibold)); Text(title).font(.system(.footnote, design: .rounded).weight(.medium)) }
-                .foregroundColor(tint).padding(.horizontal, 12).padding(.vertical, 9)
-                .background(RoundedRectangle(cornerRadius: 11, style: .continuous).fill(tint.opacity(0.13)).overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(tint.opacity(0.35), lineWidth: 1)))
-        }.buttonStyle(.plain)
-    }
+
     private var toastView: some View {
         Group {
             if let toast = toast {
@@ -512,49 +484,233 @@ struct TerminalScreen: View {
             }
         }.animation(.spring(response: 0.3), value: toast)
     }
-    private func copyScreen() {
-        guard let view = bridge.terminalView else { showToast("暂无可复制内容"); return }
-        let text = view.getTerminal().getVisibleText()
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { showToast("屏幕为空"); return }
-        copy(text, tip: "已复制整屏内容")
-    }
-    private func pasteFromClipboard() {
-        guard let str = UIPasteboard.general.string, !str.isEmpty else { showToast("剪贴板为空"); return }
-        ssh.sendText(str)
-        showToast("已粘贴")
-    }
+
     private func collectBufferAndOpen() {
         guard let view = bridge.terminalView else { showToast("暂无可复制内容"); return }
         let raw = view.getTerminal().getVisibleText()
         bufferLines = raw.split(separator: "\n", omittingEmptySubsequences: false).map { String($0).trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         showBufferSheet = true
     }
+
     private func copy(_ text: String, tip: String) { UIPasteboard.general.string = text; UIImpactFeedbackGenerator(style: .medium).impactOccurred(); showToast(tip) }
     private func showToast(_ text: String) { withAnimation { toast = text }; DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { withAnimation { toast = nil } } }
 }
 
+// MARK: - 自定义底部键盘面板
+struct CustomKeyPanel: View {
+    let onKey: (TerminalKey) -> Void
+    let onText: (String) -> Void
+    let onToggleKeyboard: () -> Void
+    
+    var body: some View {
+        VStack(spacing: 6) {
+            // 第一行：控制栏
+            HStack(spacing: 8) {
+                // 左边：收起（隐藏键盘/面板）
+                Button {
+                    onToggleKeyboard()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "keyboard.chevron.compact.down")
+                        Text("收起")
+                    }
+                    .font(.system(.footnote, design: .rounded).weight(.medium))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.gray.opacity(0.3)))
+                }
+                .buttonStyle(.plain)
+                
+                Spacer()
+                
+                // 中间：系统键盘
+                Button {
+                    onToggleKeyboard()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "keyboard")
+                        Text("系统键盘")
+                    }
+                    .font(.system(.footnote, design: .rounded).weight(.medium))
+                    .foregroundColor(.orange)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.2)))
+                }
+                .buttonStyle(.plain)
+                
+                // 粘贴按钮
+                Button {
+                    if let str = UIPasteboard.general.string {
+                        onText(str)
+                    }
+                } label: {
+                    Text("粘贴")
+                        .font(.system(.footnote, design: .rounded).weight(.medium))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.blue.opacity(0.5)))
+                }
+                .buttonStyle(.plain)
+                
+                // 回车键（大号蓝色）
+                Button {
+                    onKey(.enter)
+                } label: {
+                    Text("回车")
+                        .font(.system(.subheadline, design: .rounded).weight(.bold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.blue))
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 8)
+            .padding(.top, 6)
+            
+            // 第二行：数字及常用键
+            HStack(spacing: 4) {
+                ForEach(["1","2","3","4","5","6","7","8","9","0","-"], id: \.self) { digit in
+                    Button {
+                        onText(digit)
+                    } label: {
+                        Text(digit)
+                            .font(.system(.footnote, design: .monospaced).weight(.medium))
+                            .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.25)))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 8)
+            
+            // 第三行：快捷键区
+            HStack(spacing: 4) {
+                // 字母/短语键
+                Button { onText("x-ui") } label: { keyButtonLabel("x-ui", color: .gray.opacity(0.25)) }
+                Button { onText("88") } label: { keyButtonLabel("88", color: .gray.opacity(0.25)) }
+                Button { onText("k") } label: { keyButtonLabel("k", color: .gray.opacity(0.25)) }
+                Button { onText(" ") } label: { keyButtonLabel("空格", color: .gray.opacity(0.25)) }
+                Button { onKey(.backspace) } label: { keyButtonLabel("⌫", color: .gray.opacity(0.25)) }
+                
+                Spacer()
+                
+                // 特殊功能键（带颜色）
+                Button { onKey(.ctrlC) } label: { keyButtonLabel("Ctrl+C", color: .red.opacity(0.7)) }
+                Button { onKey(.esc) } label: { keyButtonLabel("ESC", color: .orange.opacity(0.7)) }
+                Button { onKey(.tab) } label: { keyButtonLabel("Tab", color: .gray.opacity(0.25)) }
+                Button { onKey(.arrowUp) } label: { keyButtonLabel("↑", color: .gray.opacity(0.25)) }
+                Button { onKey(.arrowDown) } label: { keyButtonLabel("↓", color: .gray.opacity(0.25)) }
+            }
+            .padding(.horizontal, 8)
+            .padding(.bottom, 6)
+        }
+        .background(Color(red: 0.1, green: 0.1, blue: 0.12))
+        .overlay(Rectangle().frame(height: 1).foregroundColor(Theme.stroke), alignment: .top)
+    }
+    
+    private func keyButtonLabel(_ title: String, color: Color) -> some View {
+        Text(title)
+            .font(.system(.footnote, design: .monospaced).weight(.medium))
+            .foregroundColor(.white)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(RoundedRectangle(cornerRadius: 6).fill(color))
+    }
+}
+
+enum TerminalKey: CaseIterable {
+    case esc, tab, ctrlC, arrowUp, arrowDown, enter, backspace
+    var label: String {
+        switch self {
+        case .esc: return "Esc"
+        case .tab: return "Tab"
+        case .ctrlC: return "^C"
+        case .arrowUp: return "↑"
+        case .arrowDown: return "↓"
+        case .enter: return "回车"
+        case .backspace: return "⌫"
+        }
+    }
+    var bytes: Data {
+        switch self {
+        case .esc: return Data([0x1B])
+        case .tab: return Data([0x09])
+        case .ctrlC: return Data([0x03])
+        case .arrowUp: return Data([0x1B, 0x5B, 0x41])
+        case .arrowDown: return Data([0x1B, 0x5B, 0x42])
+        case .enter: return Data([0x0D])
+        case .backspace: return Data([0x7F])
+        }
+    }
+}
+
+// MARK: - 输出历史/复制面板
 struct BufferSheet: View {
     let lines: [String]
     let onCopy: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+
     var body: some View {
         NavigationStack {
             ZStack {
                 Theme.bg.ignoresSafeArea()
-                if lines.isEmpty { Text("暂无输出").foregroundColor(Theme.textDim) }
-                else {
+                if lines.isEmpty {
+                    Text("暂无输出").foregroundColor(Theme.textDim)
+                } else {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 8) {
                             ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
                                 HStack(alignment: .top, spacing: 8) {
-                                    Text(line).font(.system(.footnote, design: .monospaced)).foregroundColor(Theme.text).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                                    Button { onCopy(line) } label: { Image(systemName: "doc.on.doc").font(.caption).foregroundColor(Theme.neon).padding(6).background(Circle().fill(Theme.neonSoft)) }.buttonStyle(.plain)
-                                }.padding(10).background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Theme.bgElev))
+                                    Text(line)
+                                        .font(.system(.footnote, design: .monospaced))
+                                        .foregroundColor(Theme.text)
+                                        .textSelection(.enabled) // 支持任意选中字符
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                                    // 单行复制按钮
+                                    Button {
+                                        onCopy(line)
+                                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                    } label: {
+                                        Image(systemName: "doc.on.doc")
+                                            .font(.caption)
+                                            .foregroundColor(Theme.neon)
+                                            .padding(6)
+                                            .background(Circle().fill(Theme.neonSoft))
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                                .padding(10)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .fill(Theme.bgElev)
+                                )
                             }
-                        }.padding(12)
+                        }
+                        .padding(12)
                     }
                 }
-            }.navigationTitle("输出历史").navigationBarTitleDisplayMode(.inline)
-        }.preferredColorScheme(.dark)
+            }
+            .navigationTitle("输出日志")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("关闭") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("复制全部") {
+                        onCopy(lines.joined(separator: "\n"))
+                    }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
     }
 }
 
