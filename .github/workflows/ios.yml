@@ -43,13 +43,78 @@ jobs:
             echo "🎉 构建成功！"
           else
             echo "========================================"
-            echo "❌ 构建失败！以下是日志最末尾的 100 行报错："
+            echo "❌ 构建失败！开始解析错误细节与修复建议..."
             echo "========================================"
-            tail -n 100 build_log.txt
+            
+            # 使用内置 Python 解析日志，准确定位 error 及其上下文与诊断建议
+            python3 -c '
+import re
+
+with open("build_log.txt", "r", encoding="utf-8", errors="ignore") as f:
+    lines = f.readlines()
+
+error_indices = []
+for i, line in enumerate(lines):
+    if re.search(r":\d+:\d+:\s+error:", line) or "error: " in line:
+        error_indices.append(i)
+
+if not error_indices:
+    print("⚠️ 未正则匹配到标准 Swift 错误行，打印日志末尾 100 行：")
+    print("".join(lines[-100:]))
+    exit(0)
+
+print(f"🔍 共发现 {len(error_indices)} 处错误，正在提取关键信息：\n")
+
+# 去重防止同一 block 重复展示
+printed_blocks = set()
+
+for idx in error_indices[:10]:  # 最多输出前 10 处最关键错误
+    err_line = lines[idx].strip()
+    
+    # 获取错误发生前后各 3 行代码上下文
+    start = max(0, idx - 2)
+    end = min(len(lines), idx + 4)
+    snippet = "".join(lines[start:end])
+    
+    if snippet in printed_blocks:
+        continue
+    printed_blocks.add(snippet)
+    
+    print("-" * 50)
+    print(f"📍 报错定位: {err_line}")
+    print("\n[代码上下文 / 编译器指示]:")
+    print(snippet)
+    
+    # 智能启发式建议
+    advice = "无特定模板，请检查报错对应行的方法名与签名。"
+    if "extra argument" in err_line or "missing argument" in err_line:
+        advice = "方法参数不匹配：依赖库版本变动导致参数名/必填参数改变。请检查对应库版本的调用签名。"
+    elif "cannot find" in err_line and "in scope" in err_line:
+        advice = "未找到标识符：检查是否缺少 import 模块、拼写错误，或者该符号在当前库版本中已被废弃重命名。"
+    elif "closure passed to parameter" in err_line:
+        advice = "类型不匹配（闭包与值）：目标参数需要直接传值，不要用大括号 { ... } 包装成闭包。"
+    elif "expected expression, var, or let" in err_line:
+        advice = "语法解析错误：检查条件语句中操作符两侧是否缺少空格（例如 if! 改为 if !）。"
+    elif "has no member" in err_line:
+        advice = "找不到属性/方法：对象的类型与预期不符，请确认当前库返回的具体实例类型。"
+        
+    print(f"💡 修复思路: {advice}\n")
+
+if len(error_indices) > 10:
+    print(f"⚠️ 剩余还有 {len(error_indices) - 10} 处错误未展开展示。")
+'
             exit 1
           fi
 
+      - name: 上传构建日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-failure-log
+          path: build_log.txt
+
       - name: 上传产物
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: SSHBlack-模拟器版
