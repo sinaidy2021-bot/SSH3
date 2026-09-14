@@ -2,13 +2,13 @@ import SwiftUI
 import SwiftTerm
 import UIKit
 
+// 👇 安全获取终端可见文本的扩展，避开内部属性
 extension Terminal {
     func getVisibleText() -> String {
         var result = ""
-        let buffer = self.buffer
-        for y in 0..<buffer.lines.count {
-            if let line = buffer.lines[y] {
-                result += line.translateToString() + "\n"
+        for y in 0..<self.rows {
+            if let line = self.getLine(row: y) {
+                result += line + "\n"
             }
         }
         return result
@@ -35,8 +35,8 @@ final class TerminalBridge: NSObject, TerminalViewDelegate {
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
     func clipboardCopy(source: TerminalView, content: Data) {
-        if let str = String(data: content, encoding: .utf8) {
-            UIPasteboard.general.string = str
+)        if let str = String(data: content, {
+ encoding: .utf           8 UIPasteboard.general.string = str
         }
     }
     func iTermContent(source: TerminalView, content: ArraySlice<UInt8>) {}
