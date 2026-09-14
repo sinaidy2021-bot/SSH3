@@ -19,12 +19,10 @@ enum SSHClientError: Error, LocalizedError {
     }
 }
 
-/// 把底层错误翻译成中文
 func chineseErrorText(_ error: Error) -> String {
     if let e = error as? SSHClientError {
         return e.errorDescription ?? "未知错误"
     }
-
     let ns = error as NSError
     switch ns.code {
     case 1:  return "操作不被允许"
@@ -48,9 +46,7 @@ final class SSHService: ObservableObject {
     private var parentChannel: Channel?
     private var childChannel: Channel?
 
-    /// SSH → 终端
     var onData: ((Data) -> Void)?
-    /// 断开
     var onClose: (() -> Void)?
 
     func connect(session: Session, password: String, passphrase: String) async {
@@ -127,7 +123,6 @@ final class SSHService: ObservableObject {
         let child = try await childPromise.futureResult.get()
         self.childChannel = child
 
-        // 申请 PTY
         let ptyRequest = SSHChannelRequestEvent.PseudoTerminalRequest(
             wantReply: true,
             term: "xterm-256color",
@@ -142,7 +137,6 @@ final class SSHService: ObservableObject {
         do { try await ptyPromise.futureResult.get() }
         catch { throw SSHClientError.ptyOpenFailed(chineseErrorText(error)) }
 
-        // 请求 Shell
         let shellRequest = SSHChannelRequestEvent.ShellRequest(wantReply: true)
         let shellPromise = child.eventLoop.makePromise(of: Void.self)
         child.triggerUserOutboundEvent(shellRequest, promise: shellPromise)
@@ -162,10 +156,10 @@ final class SSHService: ObservableObject {
         send(Data(text.utf8))
     }
 
+    // 👇 修复：移除 wantReply
     func resize(cols: Int, rows: Int) {
         guard let childChannel else { return }
         let request = SSHChannelRequestEvent.WindowChangeRequest(
-            wantReply: false,
             terminalCharacterWidth: max(cols, 20),
             terminalRowHeight: max(rows, 5),
             terminalPixelWidth: 0,
