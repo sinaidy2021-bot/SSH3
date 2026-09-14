@@ -380,7 +380,7 @@ class SSHManager: ObservableObject {
     }
 }
 
-// MARK: - SwiftTerm 终端桥接（修复：使用 getLine(row:) 访问可见行）
+// MARK: - SwiftTerm 终端桥接
 extension Terminal {
     func getVisibleText() -> String {
         var r = ""
@@ -441,7 +441,8 @@ struct TerminalWrapper: UIViewRepresentable {
         v.backgroundColor = UIColor(Theme.bg)
         v.nativeBackgroundColor = UIColor(Theme.bg)
         v.nativeForegroundColor = UIColor(Theme.text)
-        v.font = UIFont(name: "Menlo", size: 14) ?? UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        // 👈 字体：改为 monospacedSystemFont（SF Mono，iOS 16+ 中英文均等宽渲染），字号 15 更清晰
+        v.font = UIFont.monospacedSystemFont(ofSize: 15, weight: .regular)
         v.inputView = UIView()
 
         ssh.onData = { [weak v] d in
@@ -735,7 +736,7 @@ struct BufferSheet: View {
                                 if !block.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                                     VStack(alignment: .leading, spacing: 8) {
                                         HStack {
-                                            Text(block.contains("root@") ? "命令与输出" : "系统信息")
+                                            Text("输出块")
                                                 .font(.caption).foregroundColor(Theme.textDim)
                                             Spacer()
                                             Button {
@@ -778,18 +779,36 @@ struct BufferSheet: View {
         .preferredColorScheme(.dark)
     }
 
+    // 👈 重写分块逻辑：从上往下扫描，遇提示符切块；首块无提示符自动合并到下一块
     private func parseBlocks() {
-        let lines = rawText.split(separator: "\n", omittingEmptySubsequences: false)
-        var current = ""
+        let lines = rawText.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         var result: [String] = []
+        var current: [String] = []
+
         for line in lines {
-            let lineStr = String(line)
-            if lineStr.contains("root@") && (lineStr.contains("#") || lineStr.contains("$")) {
-                if !current.isEmpty { result.append(current); current = "" }
+            // 提示符判定：包含 @ 且包含 # 或 $
+            let isPrompt = line.contains("@") && (line.contains("#") || line.contains("$"))
+
+            if isPrompt {
+                // 遇到新提示符，把之前累积的收成一块
+                if !current.isEmpty {
+                    result.append(current.joined(separator: "\n"))
+                }
+                current = [line]
+            } else {
+                current.append(line)
             }
-            current += lineStr + "\n"
         }
-        if !current.isEmpty { result.append(current) }
+        if !current.isEmpty {
+            result.append(current.joined(separator: "\n"))
+        }
+
+        // 首块若无提示符，说明提示符被滚出屏幕，把它并入第二块，避免出现"孤立"的顶部块
+        if result.count >= 2 && !result[0].contains("@") {
+            let first = result.removeFirst()
+            result[0] = first + "\n" + result[0]
+        }
+
         if result.isEmpty { result = [rawText] }
         self.blocks = result.reversed()
     }
