@@ -11,6 +11,7 @@ import SwiftTerm
 
 typealias Color = SwiftUI.Color
 
+// MARK: - 字体
 enum FontLoader {
     static func registerFonts() {
         guard let urls = Bundle.main.urls(forResourcesWithExtension: "ttf", subdirectory: nil) else { return }
@@ -24,6 +25,7 @@ enum FontLoader {
     }
 }
 
+// MARK: - 主题
 enum Theme {
     static let blue = Color(red: 0.00, green: 0.48, blue: 1.00)
     static let blueSoft = Color(red: 0.00, green: 0.48, blue: 1.00).opacity(0.15)
@@ -38,12 +40,14 @@ enum Theme {
     static let green = Color(red: 0.20, green: 0.85, blue: 0.40)
 }
 
+// MARK: - 命令历史
 struct CommandRecord: Identifiable {
     let id = UUID()
     var command: String
     var output: String = ""
 }
 
+// MARK: - ANSI 处理
 enum TerminalColorizer {
     static let reset = "\u{1B}[0m"
     static let red = "\u{1B}[31m"
@@ -100,12 +104,30 @@ enum TerminalColorizer {
         }.joined(separator: "\n")
     }
 
-    static func isEmptyPrompt(_ line: String) -> Bool {
-        let pattern = #"^[a-zA-Z0-9_\-\.]+@[a-zA-Z0-9_\-\.]+:[^\s]*[#$]\s*$"#
+    static func isPromptLine(_ line: String) -> Bool {
+        let pattern = #"^[\w\-\.]+@[\w\-\.]+:[^\s]*[#$]\s*$"#
         return line.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    static func cleanOutput(_ text: String) -> String {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var out: [String] = []
+        var lastPrompt: String? = nil
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if isPromptLine(trimmed) {
+                if let last = lastPrompt, last == trimmed { continue }
+                lastPrompt = trimmed
+            } else {
+                lastPrompt = nil
+            }
+            out.append(line)
+        }
+        return out.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
+// MARK: - 快捷指令
 struct Shortcut: Identifiable, Codable, Equatable {
     var id = UUID()
     var name: String
@@ -129,6 +151,7 @@ class ShortcutStore: ObservableObject {
     func delete(_ s: Shortcut) { shortcuts.removeAll { $0.id == s.id }; save() }
 }
 
+// MARK: - 会话
 struct Session: Identifiable, Codable {
     var id = UUID()
     var name: String
@@ -151,13 +174,16 @@ class SessionStore: ObservableObject {
     func setPassword(_ p: String, for s: Session) { KeychainHelper.save(p, account: "session.\(s.id.uuidString).password") }
 }
 
+// MARK: - Keychain
 enum KeychainHelper {
     private static let service = "com.example.sshblack"
     static func save(_ v: String, account: String) {
         guard !v.isEmpty else { delete(account: account); return }
         let q: [String:Any] = [kSecClass as String:kSecClassGenericPassword,kSecAttrService as String:service,kSecAttrAccount as String:account]
-        SecItemDelete(q as CFDictionary); var a = q
-        a[kSecValueData as String] = Data(v.utf8); a[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        SecItemDelete(q as CFDictionary)
+        var a = q
+        a[kSecValueData as String] = Data(v.utf8)
+        a[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
         SecItemAdd(a as CFDictionary, nil)
     }
     static func read(account: String) -> String? {
@@ -172,6 +198,7 @@ enum KeychainHelper {
     }
 }
 
+// MARK: - SSH 认证
 enum SSHClientError: Error, LocalizedError {
     case notConnected
     case hostKeyChanged(String)
@@ -223,6 +250,7 @@ final class DataHandler: ChannelInboundHandler {
     func errorCaught(context: ChannelHandlerContext, error: Error) { onClose(); context.close(promise: nil) }
 }
 
+// MARK: - SSH 服务
 @MainActor
 class SSHService: ObservableObject, Identifiable {
     let id = UUID()
@@ -241,6 +269,7 @@ class SSHService: ObservableObject, Identifiable {
     private var timeoutWork: DispatchWorkItem?
     private var pendingInput = ""
     private var isCapturingOutput = false
+    private var captureStart: Date?
 
     func connect(session: Session, password: String) async {
         await disconnect()
@@ -264,6 +293,7 @@ class SSHService: ObservableObject, Identifiable {
             try await openShell(cols: 80, rows: 24)
             self.isConnected = true
             self.statusText = "已连接 · \(session.username)@\(session.host)"
+
             let work = DispatchWorkItem { [weak self] in
                 Task { @MainActor in
                     guard let self = self, self.isFiltering else { return }
@@ -276,7 +306,7 @@ class SSHService: ObservableObject, Identifiable {
                 }
             }
             self.timeoutWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
         } catch {
             self.isConnected = false
             self.statusText = "连接失败：\(error.localizedDescription)"
@@ -305,6 +335,12 @@ class SSHService: ObservableObject, Identifiable {
                                     let c = TerminalColorizer.colorize(keep)
                                     if let kd = c.data(using: .utf8) { self.onData?(kd) }
                                     self.initialBuffer = ""
+                                } else if self.initialBuffer.count > 2048 {
+                                    self.isFiltering = false
+                                    self.timeoutWork?.cancel()
+                                    let c = TerminalColorizer.colorize(self.initialBuffer)
+                                    if let kd = c.data(using: .utf8) { self.onData?(kd) }
+                                    self.initialBuffer = ""
                                 }
                             } else {
                                 self.isFiltering = false
@@ -312,22 +348,25 @@ class SSHService: ObservableObject, Identifiable {
                             }
                         } else {
                             if let s = String(data: d, encoding: .utf8) {
-                                if self.isCapturingOutput && !self.commandHistory.isEmpty {
+                                if self.isCapturingOutput, !self.commandHistory.isEmpty {
                                     let idx = self.commandHistory.count - 1
                                     let clean = TerminalColorizer.normalizeCR(TerminalColorizer.stripANSI(s))
                                     let lines = clean.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
                                     var toAppend: [String] = []
                                     for line in lines {
                                         let trimmed = line.trimmingCharacters(in: .whitespaces)
-                                        if trimmed == self.commandHistory[idx].command { continue }
-                                        if TerminalColorizer.isEmptyPrompt(trimmed) {
+                                        if TerminalColorizer.isPromptLine(trimmed) {
                                             self.isCapturingOutput = false
                                             break
                                         }
+                                        if trimmed == self.commandHistory[idx].command { continue }
                                         toAppend.append(line)
                                     }
                                     if !toAppend.isEmpty {
                                         self.commandHistory[idx].output += toAppend.joined(separator: "\n")
+                                    }
+                                    if let start = self.captureStart, Date().timeIntervalSince(start) > 15 {
+                                        self.isCapturingOutput = false
                                     }
                                 }
                                 let c = TerminalColorizer.colorize(s)
@@ -384,8 +423,7 @@ class SSHService: ObservableObject, Identifiable {
         if !cmd.isEmpty {
             commandHistory.append(CommandRecord(command: cmd))
             isCapturingOutput = true
-        } else {
-            isCapturingOutput = false
+            captureStart = Date()
         }
         pendingInput = ""
         send(Data([0x0D]))
@@ -394,6 +432,7 @@ class SSHService: ObservableObject, Identifiable {
     func sendCommand(_ command: String) {
         commandHistory.append(CommandRecord(command: command))
         isCapturingOutput = true
+        captureStart = Date()
         send(Data((command + "\n").utf8))
     }
 
@@ -433,6 +472,7 @@ class SSHManager: ObservableObject {
     }
 }
 
+// MARK: - 终端桥接
 final class TerminalBridge: NSObject, TerminalViewDelegate {
     weak var terminalView: TerminalView?
     var onInput: ((Data) -> Void)?
@@ -443,12 +483,17 @@ final class TerminalBridge: NSObject, TerminalViewDelegate {
     func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
     func scrolled(source: TerminalView, position: Double) {}
     func bell(source: TerminalView) {}
-    func clipboardCopy(source: TerminalView, content: Data) { if let s = String(data: content, encoding: .utf8) { UIPasteboard.general.string = s } }
+    func clipboardCopy(source: TerminalView, content: Data) {
+        if let s = String(data: content, encoding: .utf8) {
+            UIPasteboard.general.string = s
+        }
+    }
     func iTermContent(source: TerminalView, content: ArraySlice<UInt8>) {}
     func rangeChanged(source: TerminalView, startY: Int, endY: Int) {}
     func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {}
 }
 
+// MARK: - 键盘三态
 enum KeyboardMode { case custom, system, hidden }
 
 class CustomTerminalView: TerminalView {
@@ -473,6 +518,7 @@ struct TerminalWrapper: UIViewRepresentable {
     @ObservedObject var ssh: SSHService
     let bridge: TerminalBridge
     @Binding var keyboardMode: KeyboardMode
+
     func makeUIView(context: Context) -> CustomTerminalView {
         let v = CustomTerminalView(frame: .zero)
         v.terminalDelegate = bridge
@@ -496,6 +542,7 @@ struct TerminalWrapper: UIViewRepresentable {
         }
         return v
     }
+
     func updateUIView(_ v: CustomTerminalView, context: Context) {
         let want = (keyboardMode == .system)
         if v.allowSystemKeyboard != want {
@@ -507,6 +554,7 @@ struct TerminalWrapper: UIViewRepresentable {
     }
 }
 
+// MARK: - 主界面
 struct RootView: View {
     var body: some View { NavigationStack { SessionListView() }.tint(Theme.blue) }
 }
@@ -639,6 +687,7 @@ struct SessionEditView: View {
     }
 }
 
+// MARK: - 终端页面
 struct TerminalScreen: View {
     let session: Session
     @EnvironmentObject var shortcutStore: ShortcutStore
@@ -785,7 +834,9 @@ struct TerminalScreen: View {
         }
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
-        .sheet(isPresented: $showLog) { CommandHistorySheet(records: ssh.commandHistory) }
+        .sheet(isPresented: $showLog) {
+            CommandHistorySheet(records: ssh.commandHistory)
+        }
         .task {
             let pw = KeychainHelper.read(account: "session.\(session.id.uuidString).password") ?? ""
             if !ssh.isConnected { await ssh.connect(session: session, password: pw) }
@@ -793,6 +844,7 @@ struct TerminalScreen: View {
     }
 }
 
+// MARK: - 命令历史
 struct CommandHistorySheet: View {
     let records: [CommandRecord]
     @Environment(\.dismiss) private var dismiss
@@ -806,45 +858,39 @@ struct CommandHistorySheet: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 12) {
                             ForEach(records.reversed()) { rec in
+                                let cleaned = TerminalColorizer.cleanOutput(rec.output)
                                 VStack(alignment: .leading, spacing: 8) {
                                     HStack {
                                         Text("$ \(rec.command)")
-                                            .font(.caption)
-                                            .foregroundColor(Theme.textDim)
+                                            .font(.system(.caption, design: .monospaced))
+                                            .foregroundColor(Theme.blue)
                                             .lineLimit(1)
                                         Spacer()
                                         Button {
-                                            UIPasteboard.general.string = "$ \(rec.command)\n\(rec.output)"
+                                            UIPasteboard.general.string = cleaned
                                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
                                         } label: {
                                             HStack(spacing: 4) {
                                                 Image(systemName: "doc.on.doc")
-                                                Text("整段")
+                                                Text("复制这段")
                                             }
                                             .font(.caption)
                                             .foregroundColor(Theme.blue)
-                                            .padding(.horizontal, 8).padding(.vertical, 4)
-                                            .background(RoundedRectangle(cornerRadius: 6).fill(Theme.blueSoft))
-                                        }
-                                        Button {
-                                            UIPasteboard.general.string = rec.output
-                                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                        } label: {
-                                            HStack(spacing: 4) {
-                                                Image(systemName: "doc.text")
-                                                Text("输出")
-                                            }
-                                            .font(.caption)
-                                            .foregroundColor(Theme.blue)
-                                            .padding(.horizontal, 8).padding(.vertical, 4)
+                                            .padding(.horizontal, 10).padding(.vertical, 5)
                                             .background(RoundedRectangle(cornerRadius: 6).fill(Theme.blueSoft))
                                         }
                                     }
-                                    Text(rec.output)
-                                        .font(.system(.footnote, design: .monospaced))
-                                        .foregroundColor(Theme.text)
-                                        .textSelection(.enabled)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    if cleaned.isEmpty {
+                                        Text("(无输出)")
+                                            .font(.system(.footnote, design: .monospaced))
+                                            .foregroundColor(Theme.textDim)
+                                    } else {
+                                        Text(cleaned)
+                                            .font(.system(.footnote, design: .monospaced))
+                                            .foregroundColor(Theme.text)
+                                            .textSelection(.enabled)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
                                 }
                                 .padding(12)
                                 .background(RoundedRectangle(cornerRadius: 10).fill(Theme.bgElev))
@@ -860,7 +906,8 @@ struct CommandHistorySheet: View {
                 ToolbarItem(placement: .topBarLeading) { Button("关闭") { dismiss() } }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("复制全部") {
-                        UIPasteboard.general.string = records.map { "$ \($0.command)\n\($0.output)" }.joined(separator: "\n\n")
+                        let all = records.map { "$ \($0.command)\n\(TerminalColorizer.cleanOutput($0.output))" }.joined(separator: "\n\n")
+                        UIPasteboard.general.string = all
                     }
                 }
             }
@@ -869,6 +916,7 @@ struct CommandHistorySheet: View {
     }
 }
 
+// MARK: - 自定义键盘
 struct CustomKeyPanel: View {
     let onInput: (String) -> Void
     let onBackspace: () -> Void
