@@ -1,11 +1,11 @@
 name: iOS 构建
 
 on:
-  workflow_dispatch:  # 只有你手动点按钮才会构建
+  workflow_dispatch:  # 只有手动点按钮才会构建
 
 jobs:
   build:
-    runs-on: macos-15   # 使用最新环境，自带 Xcode 16
+    runs-on: macos-15   # 使用 Xcode 16 环境
 
     steps:
       - name: 拉取代码
@@ -27,10 +27,8 @@ jobs:
           
           echo "👉 开始编译..."
           
-          # 关闭“遇错即停”，确保能捕获到错误
           set +e
           
-          # 将日志同时输出到控制台和文件
           xcodebuild \
             -project SSHBlack.xcodeproj \
             -scheme SSHBlack \
