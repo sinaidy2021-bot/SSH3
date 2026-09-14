@@ -9,18 +9,18 @@ import SwiftTerm
 
 typealias Color = SwiftUI.Color
 
-// MARK: - 蓝黑主题（完全摒弃绿色）
+// MARK: - 蓝黑主题
 enum Theme {
-    static let blue        = Color(red: 0.00, green: 0.48, blue: 1.00)   // iOS 科技蓝
+    static let blue        = Color(red: 0.00, green: 0.48, blue: 1.00)
     static let blueSoft    = Color(red: 0.00, green: 0.48, blue: 1.00).opacity(0.15)
-    static let bg          = Color(red: 0.02, green: 0.04, blue: 0.08)   // 蓝黑
-    static let bgElev      = Color(red: 0.06, green: 0.09, blue: 0.15)   // 卡片蓝黑
+    static let bg          = Color(red: 0.02, green: 0.04, blue: 0.08)
+    static let bgElev      = Color(red: 0.06, green: 0.09, blue: 0.15)
     static let stroke      = Color.white.opacity(0.08)
     static let text        = Color.white.opacity(0.92)
     static let textDim     = Color.white.opacity(0.55)
-    static let red         = Color(red: 1.00, green: 0.30, blue: 0.30)   // Ctrl+C 红
-    static let orange      = Color(red: 1.00, green: 0.58, blue: 0.00)   // ESC 橙
-    static let magenta     = Color(red: 1.00, green: 0.40, blue: 0.80)   // q退出 粉
+    static let red         = Color(red: 1.00, green: 0.30, blue: 0.30)
+    static let orange      = Color(red: 1.00, green: 0.58, blue: 0.00)
+    static let magenta     = Color(red: 1.00, green: 0.40, blue: 0.80)
 }
 
 // MARK: - 快捷指令模型
@@ -176,19 +176,18 @@ class SSHService: ObservableObject, Identifiable {
             self.isConnected = true
             self.statusText = "已连接 · \(session.username)@\(session.host)"
             
-            // 连接后自动清屏，抹掉 Ubuntu 广告
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                 self?.sendText("clear\n")
             }
-        } catchBridge {
+        } catch {
             self.isConnected = false
-            self.status:Text = "连接失败：\(error.localized NSDescription)"
+            self.statusText = "连接失败：\(error.localizedDescription)"
             await disconnect()
         }
     }
     
-    private func openShell(colsObject: Int, rows: Int) async throws, {
-        guard let p = parent else { throw Terminal NSError(domain: "ssh", code: 1) }
+    private func openShell(cols: Int, rows: Int) async throws {
+        guard let p = parent else { throw NSError(domain: "ssh", code: 1) }
         let h = try await p.pipeline.handler(type: NIOSSHHandler.self).get()
         let cp = p.eventLoop.makePromise(of: Channel.self)
         h.createChannel(cp, channelType: .session) { [weak self] child, _ in
@@ -230,7 +229,7 @@ class SSHService: ObservableObject, Identifiable {
     }
 }
 
-// MARK: - 全局 SSH 管理器（保持连接）
+// MARK: - 全局 SSH 管理器
 @MainActor
 class SSHManager: ObservableObject {
     static let shared = SSHManager()
@@ -254,7 +253,7 @@ extension Terminal {
     }
 }
 
-final class TerminalViewDelegate {
+final class TerminalBridge: NSObject, TerminalViewDelegate {
     weak var terminalView: TerminalView?
     var onInput: ((Data) -> Void)?
     var onResize: ((Int, Int) -> Void)?
@@ -272,9 +271,9 @@ final class TerminalViewDelegate {
 
 // MARK: - 键盘互斥核心逻辑
 enum KeyboardMode {
-    case custom   // 自定义面板
-    case system   // 原生系统键盘
-    case hidden   // 全部隐藏
+    case custom
+    case system
+    case hidden
 }
 
 struct TerminalWrapper: UIViewRepresentable {
@@ -289,11 +288,7 @@ struct TerminalWrapper: UIViewRepresentable {
         v.backgroundColor = UIColor(Theme.bg)
         v.nativeBackgroundColor = UIColor(Theme.bg)
         v.nativeForegroundColor = UIColor(Theme.text)
-        
-        // 字体适配：解决 iPhone 13 国行中文字间距异常
         v.font = UIFont.systemFont(ofSize: 14)
-        
-        // 默认屏蔽系统键盘
         v.inputView = UIView()
         
         ssh.onData = { [weak v] d in
@@ -313,14 +308,12 @@ struct TerminalWrapper: UIViewRepresentable {
     
     func updateUIView(_ v: TerminalView, context: Context) {
         if keyboardMode == .system {
-            // 切换系统键盘：解除屏蔽，弹起原生
             if v.inputView != nil {
                 v.inputView = nil
                 v.reloadInputViews()
                 v.becomeFirstResponder()
             }
         } else {
-            // 自定义或隐藏：坚决屏蔽原生键盘
             if v.inputView == nil {
                 v.inputView = UIView()
                 v.reloadInputViews()
@@ -463,7 +456,7 @@ struct SessionEditView: View {
     }
 }
 
-// MARK: - 终端页面（完美布局与互斥键盘）
+// MARK: - 终端页面
 struct TerminalScreen: View {
     let session: Session
     @EnvironmentObject var shortcutStore: ShortcutStore
@@ -475,7 +468,7 @@ struct TerminalScreen: View {
     @State private var showLog = false
     @State private var lines: [String] = []
     @State private var showShortcuts = false
-    @State private var keyboardMode: KeyboardMode = .custom // 默认自定义键盘
+    @State private var keyboardMode: KeyboardMode = .custom
     
     init(session: Session) {
         self.session = session
@@ -486,7 +479,6 @@ struct TerminalScreen: View {
         ZStack {
             Theme.bg.ignoresSafeArea()
             VStack(spacing: 0) {
-                // 1. 顶部状态栏
                 HStack {
                     Button { dismiss() } label: {
                         Image(systemName: "chevron.left").font(.system(size: 16, weight: .bold)).foregroundColor(Theme.blue).padding(8).background(Circle().fill(Theme.blueSoft))
@@ -502,7 +494,6 @@ struct TerminalScreen: View {
                 .padding(.horizontal, 12).padding(.vertical, 10)
                 .background(Color.black.opacity(0.8))
                 
-                // 2. 快捷指令栏
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         Button { showShortcuts = true } label: {
@@ -522,12 +513,10 @@ struct TerminalScreen: View {
                 .background(Color.black.opacity(0.5))
                 .sheet(isPresented: $showShortcuts) { ShortcutEditView().environmentObject(shortcutStore) }
                 
-                // 3. 终端区域
                 ZStack {
                     TerminalWrapper(ssh: ssh, bridge: bridge, keyboardMode: $keyboardMode)
                         .background(Theme.bg)
                     
-                    // 如果键盘全部隐藏，点击终端恢复自定义键盘
                     if keyboardMode == .hidden {
                         Color.clear.contentShape(Rectangle()).onTapGesture {
                             keyboardMode = .custom
@@ -535,7 +524,6 @@ struct TerminalScreen: View {
                     }
                 }
                 
-                // 4. 底部键盘区域
                 if keyboardMode == .custom {
                     CustomKeyPanel(
                         onKey: { ssh.send($0) },
@@ -544,7 +532,6 @@ struct TerminalScreen: View {
                         onSwitchToSystem: { keyboardMode = .system }
                     )
                 } else if keyboardMode == .hidden {
-                    // 隐藏模式：底部显示微缩工具条
                     HStack {
                         Button { keyboardMode = .custom } label: {
                             HStack(spacing: 4) { Image(systemName: "keyboard"); Text("微缩键盘") }
@@ -586,7 +573,7 @@ struct TerminalScreen: View {
             let pw = KeychainHelper.read(account: "session.\(session.id.uuidString).password") ?? ""
             if !ssh.isConnected { await ssh.connect(session: session, password: pw) }
         }
-        .onDisappear { /* 退出保持连接，不主动断开 */ }
+        .onDisappear { }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
             if keyboardMode == .system { keyboardMode = .custom }
         }
@@ -610,14 +597,12 @@ struct TerminalScreen: View {
     }
 }
 
-// MARK: - 参考你截图的完美键盘布局
 struct CustomKeyPanel: View {
     let onKey: (Data) -> Void
     let onText: (String) -> Void
     let onHide: () -> Void
     let onSwitchToSystem: () -> Void
     
-    // 左侧按键布局
     let leftKeys: [[String]] = [
         ["1","2","3","4","5","k"],
         ["6","7","8","9","0","-"]
@@ -625,7 +610,6 @@ struct CustomKeyPanel: View {
     
     var body: some View {
         VStack(spacing: 4) {
-            // 第一行：收起 + 系统键盘
             HStack(spacing: 8) {
                 Button { onHide() } label: {
                     HStack(spacing: 4) { Image(systemName: "keyboard.chevron.compact.down"); Text("收起") }
@@ -645,11 +629,8 @@ struct CustomKeyPanel: View {
             }
             .padding(.horizontal, 8).padding(.top, 6)
             
-            // 下半部分：左侧九宫格 + 右侧大按钮
             HStack(alignment: .top, spacing: 6) {
-                // 左侧区域
                 VStack(spacing: 4) {
-                    // 数字行
                     ForEach(leftKeys.indices, id: \.self) { idx in
                         HStack(spacing: 4) {
                             ForEach(leftKeys[idx], id: \.self) { key in
@@ -662,7 +643,6 @@ struct CustomKeyPanel: View {
                         }
                     }
                     
-                    // 功能键行：Ctrl+C, ESC, 空格, 退格
                     HStack(spacing: 4) {
                         Button { onKey(Data([0x03])) } label: {
                             Text("Ctrl+C").font(.system(size: 12, weight: .medium)).foregroundColor(.white)
@@ -686,7 +666,6 @@ struct CustomKeyPanel: View {
                         }.buttonStyle(.plain)
                     }
                     
-                    // 底部快捷行：x-ui, 88, q退出
                     HStack(spacing: 4) {
                         Button { onText("x-ui") } label: { keyButtonLabel("x-ui", color: Color.gray.opacity(0.25)) }
                         Button { onText("88") } label: { keyButtonLabel("88", color: Color.gray.opacity(0.25)) }
@@ -694,7 +673,6 @@ struct CustomKeyPanel: View {
                     }
                 }
                 
-                // 右侧大按钮：粘贴 / 回车
                 VStack(spacing: 4) {
                     Button { 
                         if let str = UIPasteboard.general.string { onText(str) }
@@ -732,7 +710,6 @@ struct CustomKeyPanel: View {
     }
 }
 
-// MARK: - 应用入口
 @main
 struct SSHBlackApp: App {
     @StateObject var store = SessionStore()
