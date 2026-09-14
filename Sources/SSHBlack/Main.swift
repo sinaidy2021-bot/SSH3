@@ -409,37 +409,28 @@ final class TerminalBridge: NSObject, TerminalViewDelegate {
     func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {}
 }
 
-// MARK: - 键盘互斥（三态严格管理，彻底干掉系统键盘）
+// MARK: - 键盘互斥（三态严格管理）
 enum KeyboardMode { case custom, system, hidden }
 
 class CustomTerminalView: TerminalView {
-    /// 是否允许系统键盘
-    var allowSystemKeyboard: Bool = false
-
-    /// 根源修复 1：用 canBecomeFirstResponder 彻底阻止在自定义模式下成为第一响应者
-    override var canBecomeFirstResponder: Bool {
-        return allowSystemKeyboard
-    }
-
-    /// 根源修复 2：强制清空 SwiftTerm 自带的 inputAccessoryView（esc/ctrl 工具栏），
-    /// 这个工具栏会在系统键盘弹出时自动出现，是导致“三层键盘打架”的罪魁祸首之一。
-    override var inputAccessoryView: UIView? {
-        get { return nil }
-        set { _ = newValue }
-    }
-
-    /// 根源修复 3：强制清空 inputView，让系统键盘在自定义模式下无内容可显示
-    override var inputView: UIView? {
-        get {
+    /// 是否允许系统键盘。更新时同步刷新 inputView / inputAccessoryView。
+    var allowSystemKeyboard: Bool = false {
+        didSet {
+            guard oldValue != allowSystemKeyboard else { return }
             if allowSystemKeyboard {
-                // 系统键盘模式下返回 nil，让 iOS 显示默认键盘
-                return nil
+                // 允许系统键盘
+                self.inputView = nil
+                self.inputAccessoryView = nil
+                self.reloadInputViews()
+                if !self.isFirstResponder { _ = self.becomeFirstResponder() }
             } else {
-                // 自定义模式下返回空视图，iOS 不会弹出任何键盘
-                return UIView()
+                // 禁用系统键盘
+                self.inputView = UIView()
+                self.inputAccessoryView = nil
+                self.reloadInputViews()
+                if self.isFirstResponder { self.resignFirstResponder() }
             }
         }
-        set { _ = newValue }
     }
 }
 
@@ -456,7 +447,9 @@ struct TerminalWrapper: UIViewRepresentable {
         v.nativeBackgroundColor = UIColor(Theme.bg)
         v.nativeForegroundColor = UIColor(Theme.text)
         v.font = UIFont.monospacedSystemFont(ofSize: 15, weight: .regular)
-        v.allowSystemKeyboard = false
+        // 初始禁用系统键盘
+        v.inputView = UIView()
+        v.inputAccessoryView = nil
 
         ssh.onData = { [weak v] d in
             guard let v = v else { return }
@@ -473,16 +466,7 @@ struct TerminalWrapper: UIViewRepresentable {
     }
 
     func updateUIView(_ v: CustomTerminalView, context: Context) {
-        let wantSystem = (keyboardMode == .system)
-        if v.allowSystemKeyboard != wantSystem {
-            v.allowSystemKeyboard = wantSystem
-            v.reloadInputViews()
-            if wantSystem {
-                if !v.isFirstResponder { _ = v.becomeFirstResponder() }
-            } else {
-                if v.isFirstResponder { v.resignFirstResponder() }
-            }
-        }
+        v.allowSystemKeyboard = (keyboardMode == .system)
     }
 }
 
@@ -825,7 +809,7 @@ struct BufferSheet: View {
     }
 }
 
-// MARK: - 自定义底部键盘（完全保持你的要求）
+// MARK: - 自定义底部键盘
 struct CustomKeyPanel: View {
     let onKey: (Data) -> Void
     let onText: (String) -> Void
