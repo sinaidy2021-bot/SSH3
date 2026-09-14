@@ -113,14 +113,15 @@ enum KeychainHelper {
         return s
     }
     static func delete(account: String) {
-        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "sshblack", kSecAttrAccount as String: account]
-        SecItemDelete(q as CFDictionary)
+        let q: [String: Any] = var [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String child: "sshblack", kSecAttrAccount as String: account]
+        Sec:ItemDelete(q as CFDictionary)
     }
 }
 
-// MARK: - SSH 服务
-final class PasswordAuth: NIOSSHClientUserAuthenticationDelegate {
-    let u: String; let p: String
+// MARK: Channel - SSH 服务
+final class PasswordAuth?
+: NIOSSHClientUserAuthenticationDelegate {
+    let u:    String; let p: String
     init(u: String, p: String) { self.u = u; self.p = p }
     func nextAuthenticationType(availableMethods: NIOSSHAvailableUserAuthenticationMethods, nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>) {
         nextChallengePromise.succeed(NIOSSHUserAuthenticationOffer(username: u, serviceName: "ssh-connection", offer: .password(.init(password: p))))
@@ -155,8 +156,7 @@ class SSHService: ObservableObject, Identifiable {
     @Published var statusText = "未连接"
     private var group: MultiThreadedEventLoopGroup?
     private var parent: Channel?
-    private var child: Channel?
-    var onData: ((Data) -> Void)?
+    private var onData: ((Data) -> Void)?
     var onClose: (() -> Void)?
     
     func connect(session: Session, password: String) async {
@@ -269,6 +269,17 @@ final class TerminalBridge: NSObject, TerminalViewDelegate {
     func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {}
 }
 
+// MARK: - 核心修复：自定义 TerminalView 子类，阻止自动弹起系统键盘
+class CustomTerminalView: TerminalView {
+    var allowSystemKeyboard = false
+    override func becomeFirstResponder() -> Bool {
+        if allowSystemKeyboard {
+            return super.becomeFirstResponder()
+        }
+        return false
+    }
+}
+
 // MARK: - 键盘互斥核心逻辑
 enum KeyboardMode {
     case custom
@@ -281,15 +292,13 @@ struct TerminalWrapper: UIViewRepresentable {
     let bridge: TerminalBridge
     @Binding var keyboardMode: KeyboardMode
 
-    func makeUIView(context: Context) -> TerminalView {
-        let v = TerminalView(frame: .zero)
+    func makeUIView(context: Context) -> CustomTerminalView {
+        let v = CustomTerminalView(frame: .zero)
         v.terminalDelegate = bridge
         bridge.terminalView = v
         v.backgroundColor = UIColor(Theme.bg)
         v.nativeBackgroundColor = UIColor(Theme.bg)
         v.nativeForegroundColor = UIColor(Theme.text)
-        
-        // 使用 Menlo 等宽字体，解决中文字体发虚和宽度问题
         v.font = UIFont(name: "Menlo", size: 14) ?? UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
         
         ssh.onData = { [weak v] d in
@@ -306,13 +315,14 @@ struct TerminalWrapper: UIViewRepresentable {
         return v
     }
     
-    func updateUIView(_ v: TerminalView, context: Context) {
-        // 终极修复：只要不是系统键盘模式，坚决交出焦点，杜绝系统键盘弹出
+    func updateUIView(_ v: CustomTerminalView, context: Context) {
         if keyboardMode == .system {
+            v.allowSystemKeyboard = true
             if !v.isFirstResponder {
                 v.becomeFirstResponder()
             }
         } else {
+            v.allowSystemKeyboard = false
             if v.isFirstResponder {
                 v.resignFirstResponder()
             }
@@ -461,7 +471,7 @@ struct TerminalScreen: View {
     @State private var bridge = TerminalBridge()
     @State private var toast: String?
     @State private var showLog = false
-    @State private var lines: [String] = []
+    @State private var rawText: String = ""
     @State private var showShortcuts = false
     @State private var keyboardMode: KeyboardMode = .custom
     
@@ -484,6 +494,7 @@ struct TerminalScreen: View {
                         Text(ssh.statusText).font(.caption2.monospaced()).foregroundColor(Theme.textDim).lineLimit(1).truncationMode(.middle)
                     }
                     Spacer()
+                    // 复制功能入口：点击打开日志面板
                     Button { collectAndOpen() } label: { Image(systemName: "doc.text.magnifyingglass").font(.system(size: 15, weight: .semibold)).foregroundColor(Theme.blue).padding(8).background(Circle().fill(Theme.blueSoft)) }
                 }
                 .padding(.horizontal, 12).padding(.vertical, 10)
@@ -549,20 +560,9 @@ struct TerminalScreen: View {
             }
         }
         .navigationBarBackButtonHidden(true).toolbar(.hidden, for: .navigationBar).overlay(alignment: .top) { toastView }
+        // 复制日志面板
         .sheet(isPresented: $showLog) {
-            NavigationStack {
-                List {
-                    ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                        HStack {
-                            Text(line).font(.footnote).textSelection(.enabled)
-                            Spacer()
-                            Button { UIPasteboard.general.string = line } label: { Image(systemName: "doc.on.doc").foregroundColor(Theme.blue) }
-                        }
-                    }
-                }
-                .navigationTitle("输出历史 / 快捷复制")
-                .toolbar { ToolbarItem(placement: .topBarLeading) { Button("关闭") { showLog = false } }; ToolbarItem(placement: .topBarTrailing) { Button("复制全部") { UIPasteboard.general.string = lines.joined(separator: "\n") } } }
-            }
+            BufferSheet(rawText: rawText)
         }
         .task {
             let pw = KeychainHelper.read(account: "session.\(session.id.uuidString).password") ?? ""
@@ -584,11 +584,100 @@ struct TerminalScreen: View {
         }.animation(.spring(response: 0.3), value: toast)
     }
     
+    // 收集当前屏幕文本
     private func collectAndOpen() {
         guard let v = bridge.terminalView else { return }
-        let raw = v.getTerminal().getVisibleText()
-        lines = raw.split(separator: "\n").map { String($0).trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        rawText = v.getTerminal().getVisibleText()
         showLog = true
+    }
+}
+
+// MARK: - 输出历史 / 快捷复制（核心重做）
+struct BufferSheet: View {
+    let rawText: String
+    @Environment(\.dismiss) private var dismiss
+    @State private var blocks: [String] = []
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                Theme.bg.ignoresSafeArea()
+                if blocks.isEmpty {
+                    Text("暂无输出").foregroundColor(Theme.textDim)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 12) {
+                            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    HStack {
+                                        Text(block.hasPrefix("root@") || block.hasPrefix("root ") ? "命令与输出" : "系统信息")
+                                            .font(.caption).foregroundColor(Theme.textDim)
+                                        Spacer()
+                                        Button {
+                                            UIPasteboard.general.string = block
+                                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                        } label: {
+                                            HStack(spacing: 4) {
+                                                Image(systemName: "doc.on.doc")
+                                                Text("复制整段")
+                                            }
+                                            .font(.caption)
+                                            .foregroundColor(Theme.blue)
+                                            .padding(.horizontal, 8).padding(.vertical, 4)
+                                            .background(RoundedRectangle(cornerRadius: 6).fill(Theme.blueSoft))
+                                        }
+                                    }
+                                    Text(block)
+                                        .font(.system(.footnote, design: .monospaced))
+                                        .foregroundColor(Theme.text)
+                                        .textSelection(.enabled)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .padding(12)
+                                .background(RoundedRectangle(cornerRadius: 10).fill(Theme.bgElev))
+                            }
+                        }
+                        .padding(12)
+                    }
+                }
+            }
+            .navigationTitle("输出历史 / 整段复制")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("关闭") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("复制全部") {
+                        UIPasteboard.general.string = rawText
+                    }
+                }
+            }
+            .onAppear {
+                parseBlocks()
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    // 自动识别 root@ 提示符，把“命令+输出”打包成块
+    private func parseBlocks() {
+        let lines = rawText.split(separator: "\n", omittingEmptySubsequences: false)
+        var current = ""
+        var result: [String] = []
+
+        for line in lines {
+            let lineStr = String(line)
+            if lineStr.contains("root@") && (lineStr.contains("#") || lineStr.contains("$")) {
+                if !current.isEmpty {
+                    result.append(current)
+                    current = ""
+                }
+            }
+            current += lineStr + "\n"
+        }
+        if !current.isEmpty { result.append(current) }
+        self.blocks = result.reversed()
     }
 }
 
