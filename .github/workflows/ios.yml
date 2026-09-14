@@ -20,19 +20,10 @@ jobs:
           xcodegen generate
           echo "✅ 生成完毕"
 
-      - name: 解析 Swift Package 依赖
-        run: |
-          echo "👉 解析依赖..."
-          xcodebuild -resolvePackageDependencies -project SSHBlack.xcodeproj -scheme SSHBlack
-
       - name: 构建模拟器版本
-        id: build_step
         run: |
           echo "👉 开始编译..."
-          
-          set -o pipefail
-          
-          # 执行编译，同时将完整输出重定向到文件
+          set +e
           xcodebuild \
             -project SSHBlack.xcodeproj \
             -scheme SSHBlack \
@@ -41,31 +32,21 @@ jobs:
             -derivedDataPath build \
             -skipPackagePluginValidation \
             -skipMacroValidation \
-            CODE_SIGNING_ALLOWED=NO > build_log.txt 2>&1 || BUILD_FAILED=true
-
-          if [ "$BUILD_FAILED" = "true" ]; then
-            echo "========================================"
-            echo "❌ 编译失败，正在提取关键错误日志..."
-            echo "========================================"
-            
-            # 使用 grep 提取包含 error: 的行及其前后 2 行
-            grep -n -C 2 "error:" build_log.txt | head -n 80 || tail -n 60 build_log.txt
-            
-            echo "========================================"
-            exit 1
-          else
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee build_log.txt
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
+          
+          if [ $EXIT_CODE -eq 0 ]; then
             echo "🎉 构建成功！"
+          else
+            echo "========================================"
+            echo "❌ 构建失败！以下是日志末尾的 100 行报错："
+            echo "========================================"
+            tail -n 100 build_log.txt
+            exit 1
           fi
 
-      - name: 上传失败日志
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-failure-log
-          path: build_log.txt
-
       - name: 上传产物
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: SSHBlack-模拟器版
