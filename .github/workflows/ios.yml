@@ -23,6 +23,8 @@ jobs:
       - name: 构建模拟器版本
         run: |
           echo "👉 开始编译..."
+          
+          # 关闭 errexit，但不使用管道，直接重定向到日志文件，确保退出码能正确捕获
           set +e
           xcodebuild \
             -project SSHBlack.xcodeproj \
@@ -32,17 +34,19 @@ jobs:
             -derivedDataPath build \
             -skipPackagePluginValidation \
             -skipMacroValidation \
-            CODE_SIGNING_ALLOWED=NO 2>&1 | tee build_log.txt
-          EXIT_CODE=${PIPESTATUS[0]}
+            CODE_SIGNING_ALLOWED=NO > build_log.txt 2>&1
+          EXIT_CODE=$?
           set -e
           
           if [ $EXIT_CODE -eq 0 ]; then
             echo "🎉 构建成功！"
           else
             echo "========================================"
-            echo "❌ 构建失败！以下是日志末尾的 100 行报错："
+            echo "❌ 构建失败！以下是错误摘要及上下文："
             echo "========================================"
-            tail -n 100 build_log.txt
+            grep -n -B 5 -A 5 "error:" build_log.txt | tail -n 100
+            echo "========================================"
+            echo "👉 请截图以上报错信息。"
             exit 1
           fi
 
