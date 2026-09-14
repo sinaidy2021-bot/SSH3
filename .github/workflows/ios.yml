@@ -20,12 +20,19 @@ jobs:
           xcodegen generate
           echo "✅ 生成完毕"
 
+      - name: 解析 Swift Package 依赖
+        run: |
+          echo "👉 解析依赖..."
+          xcodebuild -resolvePackageDependencies -project SSHBlack.xcodeproj -scheme SSHBlack
+
       - name: 构建模拟器版本
+        id: build_step
         run: |
           echo "👉 开始编译..."
           
-          set +e
+          set -o pipefail
           
+          # 执行编译，同时将完整输出重定向到文件
           xcodebuild \
             -project SSHBlack.xcodeproj \
             -scheme SSHBlack \
@@ -34,79 +41,23 @@ jobs:
             -derivedDataPath build \
             -skipPackagePluginValidation \
             -skipMacroValidation \
-            CODE_SIGNING_ALLOWED=NO 2>&1 | tee build_log.txt
-          
-          EXIT_CODE=${PIPESTATUS[0]}
-          set -e
-          
-          if [ $EXIT_CODE -eq 0 ]; then
-            echo "🎉 构建成功！"
-          else
+            CODE_SIGNING_ALLOWED=NO > build_log.txt 2>&1 || BUILD_FAILED=true
+
+          if [ "$BUILD_FAILED" = "true" ]; then
             echo "========================================"
-            echo "❌ 构建失败！开始解析错误细节与修复建议..."
+            echo "❌ 编译失败，正在提取关键错误日志..."
             echo "========================================"
             
-            # 使用内置 Python 解析日志，准确定位 error 及其上下文与诊断建议
-            python3 -c '
-import re
-
-with open("build_log.txt", "r", encoding="utf-8", errors="ignore") as f:
-    lines = f.readlines()
-
-error_indices = []
-for i, line in enumerate(lines):
-    if re.search(r":\d+:\d+:\s+error:", line) or "error: " in line:
-        error_indices.append(i)
-
-if not error_indices:
-    print("⚠️ 未正则匹配到标准 Swift 错误行，打印日志末尾 100 行：")
-    print("".join(lines[-100:]))
-    exit(0)
-
-print(f"🔍 共发现 {len(error_indices)} 处错误，正在提取关键信息：\n")
-
-# 去重防止同一 block 重复展示
-printed_blocks = set()
-
-for idx in error_indices[:10]:  # 最多输出前 10 处最关键错误
-    err_line = lines[idx].strip()
-    
-    # 获取错误发生前后各 3 行代码上下文
-    start = max(0, idx - 2)
-    end = min(len(lines), idx + 4)
-    snippet = "".join(lines[start:end])
-    
-    if snippet in printed_blocks:
-        continue
-    printed_blocks.add(snippet)
-    
-    print("-" * 50)
-    print(f"📍 报错定位: {err_line}")
-    print("\n[代码上下文 / 编译器指示]:")
-    print(snippet)
-    
-    # 智能启发式建议
-    advice = "无特定模板，请检查报错对应行的方法名与签名。"
-    if "extra argument" in err_line or "missing argument" in err_line:
-        advice = "方法参数不匹配：依赖库版本变动导致参数名/必填参数改变。请检查对应库版本的调用签名。"
-    elif "cannot find" in err_line and "in scope" in err_line:
-        advice = "未找到标识符：检查是否缺少 import 模块、拼写错误，或者该符号在当前库版本中已被废弃重命名。"
-    elif "closure passed to parameter" in err_line:
-        advice = "类型不匹配（闭包与值）：目标参数需要直接传值，不要用大括号 { ... } 包装成闭包。"
-    elif "expected expression, var, or let" in err_line:
-        advice = "语法解析错误：检查条件语句中操作符两侧是否缺少空格（例如 if! 改为 if !）。"
-    elif "has no member" in err_line:
-        advice = "找不到属性/方法：对象的类型与预期不符，请确认当前库返回的具体实例类型。"
-        
-    print(f"💡 修复思路: {advice}\n")
-
-if len(error_indices) > 10:
-    print(f"⚠️ 剩余还有 {len(error_indices) - 10} 处错误未展开展示。")
-'
+            # 使用 grep 提取包含 error: 的行及其前后 2 行
+            grep -n -C 2 "error:" build_log.txt | head -n 80 || tail -n 60 build_log.txt
+            
+            echo "========================================"
             exit 1
+          else
+            echo "🎉 构建成功！"
           fi
 
-      - name: 上传构建日志
+      - name: 上传失败日志
         if: failure()
         uses: actions/upload-artifact@v4
         with:
