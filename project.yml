@@ -7,15 +7,12 @@ options:
   createIntermediateGroups: true
 
 packages:
-  swift-nio:
-    url: https://github.com/apple/swift-nio.git
-    from: "2.65.0"
   swift-nio-ssh:
     url: https://github.com/apple/swift-nio-ssh.git
-    from: "0.15.0"
+    exactVersion: "0.15.0"
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm.git
-    exactVersion: "1.2.0"   # 👈 修复：必须用 exactVersion，不能用 exact
+    exactVersion: "1.2.0"
 
 targets:
   SSHBlack:
@@ -40,10 +37,6 @@ targets:
     dependencies:
       - package: swift-nio-ssh
         product: NIOSSH
-      - package: swift-nio
-        product: NIOCore
-      - package: swift-nio
-        product: NIOPosix
       - package: SwiftTerm
         product: SwiftTerm
 
