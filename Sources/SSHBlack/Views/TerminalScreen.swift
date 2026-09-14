@@ -108,18 +108,18 @@ struct TerminalScreen: View {
 
     private var bottomToolbar: some View {
         HStack(spacing: 10) {
-            // 👇 修复：使用 SwiftUI.Color
-            toolButton(icon: "doc.on.doc.fill", title: "复制屏幕", tint: SwiftUI.Color(Theme.neon)) {
+            // 👇 修复了这里，直接使用 Theme 颜色
+            toolButton(icon: "doc.on.doc.fill", title: "复制屏幕", tint: Theme.neon) {
                 copyScreen()
             }
-            toolButton(icon: "doc.on.clipboard", title: "粘贴", tint: SwiftUI.Color(Theme.violet)) {
+            toolButton(icon: "doc.on.clipboard", title: "粘贴", tint: Theme.violet) {
                 pasteFromClipboard()
             }
-            toolButton(icon: "eraser.fill", title: "清屏", tint: SwiftUI.Color(Theme.magenta)) {
+            toolButton(icon: "eraser.fill", title: "清屏", tint: Theme.magenta) {
                 ssh.send(Data([0x0C]))
             }
             Spacer()
-            toolButton(icon: "keyboard", title: "键盘", tint: SwiftUI.Color(Theme.neon)) {
+            toolButton(icon: "keyboard", title: "键盘", tint: Theme.neon) {
                 UIApplication.shared.sendAction(
                     #selector(UIResponder.becomeFirstResponder),
                     to: nil, from: nil, for: nil
@@ -138,7 +138,7 @@ struct TerminalScreen: View {
     private func toolButton(
         icon: String,
         title: String,
-        tint: SwiftUI.Color,
+        tint: Color,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
@@ -183,7 +183,6 @@ struct TerminalScreen: View {
             showToast("暂无可复制内容")
             return
         }
-        // 👇 修复：改用我们自己的方法
         let text = view.getTerminal().getVisibleText()
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             showToast("屏幕为空")
