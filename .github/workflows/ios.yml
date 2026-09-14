@@ -10,25 +10,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 下载中英文等宽字体
+      - name: 下载思源等宽字体（仅 Regular）
         run: |
           mkdir -p Sources/SSHBlack/Fonts
-          brew install p7zip
-          # 同时尝试两个 release URL，任一成功即可
-          (curl -fL -o /tmp/sarasa.7z "https://github.com/be5invis/Sarasa-Gothic/releases/download/v1.0.29/SarasaMonoSC-TTF-1.0.29.7z" \
-            || curl -fL -o /tmp/sarasa.7z "https://github.com/be5invis/Sarasa-Gothic/releases/download/v1.0.29/SarasaMonoSC-TTF-1.0.29.7z") \
-            && 7z x /tmp/sarasa.7z -o/tmp/sarasa/ -y \
-            && find /tmp/sarasa -name "*.ttf" -exec cp {} Sources/SSHBlack/Fonts/ \;
-          ls -la Sources/SSHBlack/Fonts/ || true
+          curl -fL -o Sources/SSHBlack/Fonts/SourceHanMonoSC-Regular.otf \
+            "https://github.com/adobe-fonts/source-han-mono/raw/release/OTF/SimplifiedChinese/SourceHanMonoSC-Regular.otf"
+          echo "👉 字体文件："
+          ls -la Sources/SSHBlack/Fonts/
 
       - name: 安装 XcodeGen
         run: brew install xcodegen
 
       - name: 生成 Xcode 工程
-        run: xcodegen generate
+        run: |
+          echo "👉 生成 Xcode 工程..."
+          xcodegen generate
+          echo "✅ 生成完毕"
 
       - name: 构建真机 IPA
         run: |
+          echo "👉 开始编译..."
           set +e
           xcodebuild archive \
             -project SSHBlack.xcodeproj \
@@ -40,12 +41,24 @@ jobs:
             -skipPackagePluginValidation -skipMacroValidation > build_log.txt 2>&1
           CODE=$?
           set -e
-          if [ $CODE -ne 0 ]; then
-            echo "❌ 编译失败"; grep -n -B 3 -A 3 "error:" build_log.txt | tail -n 80; exit 1
+
+          if [ $CODE -eq 0 ]; then
+            echo "🎉 编译成功"
+          else
+            echo "========================================"
+            echo "❌ 编译失败！以下是错误摘要（含上下文）"
+            echo "========================================"
+            grep -n -B 3 -A 3 "error:" build_log.txt | tail -n 120
+            echo "========================================"
+            echo "👉 请截图以上内容"
+            exit 1
           fi
+
+          echo "✅ 打包 Payload..."
           mkdir -p build/Payload
           cp -R build/SSHBlack.xcarchive/Products/Applications/SSHBlack.app build/Payload/
           cd build && zip -r SSHBlack-unsigned.ipa Payload
+          echo "🎉 IPA 打包完成"
 
       - uses: actions/upload-artifact@v4
         with:
