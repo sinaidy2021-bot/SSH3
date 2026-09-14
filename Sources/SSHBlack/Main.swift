@@ -2,6 +2,7 @@ import SwiftUI
 import Foundation
 import UIKit
 import Security
+import Crypto
 import NIOCore
 import NIOPosix
 import NIOSSH
@@ -23,6 +24,71 @@ enum Theme {
     static let magenta     = Color(red: 1.00, green: 0.40, blue: 0.80)
 }
 
+// MARK: - 终端输出自动着色引擎
+enum TerminalColorizer {
+    // ANSI 转义码
+    static let reset       = "\u{1B}[0m"
+    static let red         = "\u{1B}[31m"
+    static let green       = "\u{1B}[32m"
+    static let yellow      = "\u{1B}[33m"
+    static let blue        = "\u{1B}[34m"
+    static let cyan        = "\u{1B}[36m"
+    static let underline   = "\u{1B}[4m"
+
+    // 关键词（小写匹配）
+    static let errorKeywords   = ["error", "failed", "fail", "fatal", "denied", "refused", "exception"]
+    static let successKeywords = ["success", "ok", "done", "complete", "finished", "running"]
+    static let warnKeywords    = ["warning", "warn", "deprecated"]
+
+    /// 对一段纯文本做高亮，不改变字符数（ANSI 码会被终端解析，不占显示宽度）
+    static func colorize(_ text: String) -> String {
+        // 如果这段文本里已经包含 ANSI 转义，说明服务器自己上色了，不干预
+        if text.contains("\u{1B}[") { return text }
+
+        var result = text
+
+        // 逐行处理，避免跨行误匹配
+        let lines = result.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var newLines: [String] = []
+
+        for line in lines {
+            if line.isEmpty {
+                newLines.append(line)
+                continue
+            }
+
+            let lower = line.lowercased()
+            var colored = line
+
+            // 1. 错误关键词 → 红
+            if errorKeywords.contains(where: { lower.contains($0) }) {
+                colored = red + line + reset
+            }
+            // 2. 成功关键词 → 绿
+            else if successKeywords.contains(where: { lower.contains($0) }) {
+                colored = green + line + reset
+            }
+            // 3. 警告关键词 → 黄
+            else if warnKeywords.contains(where: { lower.contains($0) }) {
+                colored = yellow + line + reset
+            }
+            // 4. IPv4 地址 → 青
+            else if line.range(of: #"\b(?:\d{1,3}\.){3}\d{1,3}\b"#, options: .regularExpression) != nil {
+                colored = cyan + line + reset
+            }
+            // 5. URL → 蓝 + 下划线
+            else if line.contains("http://") || line.contains("https://") {
+                colored = blue + underline + line + reset
+            }
+
+            newLines.append(colored)
+        }
+
+        result = newLines.joined(separator: "\n")
+        return result
+    }
+}
+
 // MARK: - 快捷指令模型
 struct Shortcut: Identifiable, Codable, Equatable {
     var id = UUID()
@@ -34,7 +100,7 @@ struct Shortcut: Identifiable, Codable, Equatable {
 class ShortcutStore: ObservableObject {
     @Published var shortcuts: [Shortcut] = []
     private let key = "sshblack.shortcuts.v1"
-    
+
     init() { load() }
     func load() {
         guard let data = UserDefaults.standard.data(forKey: key),
@@ -95,11 +161,13 @@ class SessionStore: ObservableObject {
     func setPassword(_ p: String, for s: Session) { KeychainHelper.save(p, account: "session.\(s.id.uuidString).password") }
 }
 
+// MARK: - Keychain
 enum KeychainHelper {
+    private static let service = "com.example.sshblack"
     static func save(_ value: String, account: String) {
         guard !value.isEmpty else { delete(account: account); return }
         let data = Data(value.utf8)
-        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "sshblack", kSecAttrAccount as String: account]
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
         SecItemDelete(q as CFDictionary)
         var attrs = q
         attrs[kSecValueData as String] = data
@@ -107,18 +175,34 @@ enum KeychainHelper {
         SecItemAdd(attrs as CFDictionary, nil)
     }
     static func read(account: String) -> String? {
-        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "sshblack", kSecAttrAccount as String: account, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
         var item: AnyObject?
         guard SecItemCopyMatching(q as CFDictionary, &item) == errSecSuccess, let d = item as? Data, let s = String(data: d, encoding: .utf8) else { return nil }
         return s
     }
     static func delete(account: String) {
-        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "sshblack", kSecAttrAccount as String: account]
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
         SecItemDelete(q as CFDictionary)
     }
 }
 
-// MARK: - SSH 服务
+// MARK: - SSH 认证（TOFU 主机密钥验证）
+enum SSHClientError: Error, LocalizedError {
+    case notConnected
+    case hostKeyChanged(String)
+    case connectionFailed(String)
+    case openShellFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .notConnected: return "尚未连接服务器"
+        case .hostKeyChanged(let fp): return "⚠️ 主机密钥已变更！\n新指纹：\(fp)\n可能遭受中间人攻击，已拒绝连接。"
+        case .connectionFailed(let s): return "连接失败：\(s)"
+        case .openShellFailed(let s): return "打开 Shell 失败：\(s)"
+        }
+    }
+}
+
 final class PasswordAuth: NIOSSHClientUserAuthenticationDelegate {
     let u: String; let p: String
     init(u: String, p: String) { self.u = u; self.p = p }
@@ -127,12 +211,31 @@ final class PasswordAuth: NIOSSHClientUserAuthenticationDelegate {
     }
 }
 
-final class AcceptAllHostKeys: NIOSSHClientServerAuthenticationDelegate {
+final class TOFUHostKeyDelegate: NIOSSHClientServerAuthenticationDelegate {
+    let host: String
+    let port: Int
+    init(host: String, port: Int) { self.host = host; self.port = port }
+
     func validateHostKey(hostKey: NIOSSHPublicKey, validationCompletePromise: EventLoopPromise<Void>) {
-        validationCompletePromise.succeed(())
+        let keyDescription = String(describing: hostKey)
+        let hash = SHA256.hash(data: Data(keyDescription.utf8))
+        let fingerprint = hash.compactMap { String(format: "%02x", $0) }.joined()
+
+        let account = "hostkey.\(host):\(port)"
+        if let saved = KeychainHelper.read(account: account) {
+            if saved == fingerprint {
+                validationCompletePromise.succeed(())
+            } else {
+                validationCompletePromise.fail(SSHClientError.hostKeyChanged(fingerprint))
+            }
+        } else {
+            KeychainHelper.save(fingerprint, account: account)
+            validationCompletePromise.succeed(())
+        }
     }
 }
 
+// MARK: - 数据处理器
 final class DataHandler: ChannelInboundHandler {
     typealias InboundIn = SSHChannelData
     let onData: (Data) -> Void
@@ -148,6 +251,7 @@ final class DataHandler: ChannelInboundHandler {
     func errorCaught(context: ChannelHandlerContext, error: Error) { onClose(); context.close(promise: nil) }
 }
 
+// MARK: - SSH 服务
 @MainActor
 class SSHService: ObservableObject, Identifiable {
     let id = UUID()
@@ -158,64 +262,91 @@ class SSHService: ObservableObject, Identifiable {
     private var child: Channel?
     var onData: ((Data) -> Void)?
     var onClose: (() -> Void)?
-    
+
     private var initialBuffer = ""
-    private var hasSeenLogin = false
-    
+    private var isFiltering = false
+    private var timeoutWork: DispatchWorkItem?
+
     func connect(session: Session, password: String) async {
         await disconnect()
         statusText = "正在连接…"
+        isFiltering = true
+        initialBuffer = ""
+
         do {
             let g = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            let keyDelegate = TOFUHostKeyDelegate(host: session.host, port: session.port)
+
             let bootstrap = ClientBootstrap(group: g).channelInitializer { ch in
                 ch.pipeline.addHandler(NIOSSHHandler(
-                    role: .client(.init(userAuthDelegate: PasswordAuth(u: session.username, p: password), serverAuthDelegate: AcceptAllHostKeys())),
-                    allocator: ch.allocator, inboundChildChannelInitializer: nil
+                    role: .client(.init(
+                        userAuthDelegate: PasswordAuth(u: session.username, p: password),
+                        serverAuthDelegate: keyDelegate
+                    )),
+                    allocator: ch.allocator,
+                    inboundChildChannelInitializer: nil
                 ))
             }
             let ch = try await bootstrap.connect(host: session.host, port: session.port).get()
-            self.group = g; self.parent = ch
+            self.group = g
+            self.parent = ch
+
             try await openShell(cols: 80, rows: 24)
             self.isConnected = true
             self.statusText = "已连接 · \(session.username)@\(session.host)"
+
+            let work = DispatchWorkItem { [weak self] in
+                Task { @MainActor in
+                    guard let self = self, self.isFiltering else { return }
+                    self.isFiltering = false
+                    if !self.initialBuffer.isEmpty {
+                        if let d = self.initialBuffer.data(using: .utf8) { self.onData?(d) }
+                        self.initialBuffer = ""
+                    }
+                }
+            }
+            self.timeoutWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
         } catch {
             self.isConnected = false
             self.statusText = "连接失败：\(error.localizedDescription)"
+            isFiltering = false
             await disconnect()
         }
     }
-    
+
     private func openShell(cols: Int, rows: Int) async throws {
-        guard let p = parent else { throw NSError(domain: "ssh", code: 1) }
+        guard let p = parent else { throw SSHClientError.notConnected }
         let h = try await p.pipeline.handler(type: NIOSSHHandler.self).get()
         let cp = p.eventLoop.makePromise(of: Channel.self)
         h.createChannel(cp, channelType: .session) { [weak self] child, _ in
-            guard let self = self else { return child.eventLoop.makeFailedFuture(NSError(domain: "ssh", code: 2)) }
+            guard let self = self else { return child.eventLoop.makeFailedFuture(SSHClientError.notConnected) }
             return child.pipeline.addHandler(DataHandler(
                 onData: { [weak self] d in
                     Task { @MainActor in
                         guard let self = self else { return }
-                        if self.hasSeenLogin {
-                            self.onData?(d)
-                        } else {
+                        if self.isFiltering {
                             if let str = String(data: d, encoding: .utf8) {
                                 self.initialBuffer += str
                                 if let range = self.initialBuffer.range(of: "Last login:") {
-                                    self.hasSeenLogin = true
-                                    let keep = self.initialBuffer[range.lowerBound...]
+                                    self.isFiltering = false
+                                    self.timeoutWork?.cancel()
+                                    let keep = String(self.initialBuffer[range.lowerBound...])
                                     if let keepData = keep.data(using: .utf8) {
-                                        self.onData?(keepData)
-                                    }
-                                    self.initialBuffer = ""
-                                } else if self.initialBuffer.count > 32768 {
-                                    self.hasSeenLogin = true
-                                    if let keepData = self.initialBuffer.data(using: .utf8) {
-                                        self.onData?(keepData)
+                                        self.onData?(Data(TerminalColorizer.colorize(String(decoding: keepData, as: UTF8.self)).utf8))
                                     }
                                     self.initialBuffer = ""
                                 }
                             } else {
-                                self.hasSeenLogin = true
+                                self.isFiltering = false
+                                self.onData?(d)
+                            }
+                        } else {
+                            // 👈 核心：把数据做自动着色后再投递给终端
+                            if let str = String(data: d, encoding: .utf8) {
+                                let colored = TerminalColorizer.colorize(str)
+                                self.onData?(Data(colored.utf8))
+                            } else {
                                 self.onData?(d)
                             }
                         }
@@ -235,12 +366,15 @@ class SSHService: ObservableObject, Identifiable {
         c.triggerUserOutboundEvent(sh, promise: sp)
         try await sp.futureResult.get()
     }
-    
+
     func send(_ data: Data) {
         guard let c = child else { return }
-        var b = c.allocator.buffer(capacity: data.count)
-        b.writeBytes(data)
-        c.writeAndFlush(NIOAny(SSHChannelData(type: .channel, data: .byteBuffer(b))), promise: nil)
+        let bytes = [UInt8](data)
+        c.eventLoop.execute {
+            var b = c.allocator.buffer(capacity: bytes.count)
+            b.writeBytes(bytes)
+            c.writeAndFlush(NIOAny(SSHChannelData(type: .channel, data: .byteBuffer(b))), promise: nil)
+        }
     }
     func sendText(_ t: String) { send(Data(t.utf8)) }
     func resize(cols: Int, rows: Int) {
@@ -249,6 +383,7 @@ class SSHService: ObservableObject, Identifiable {
         c.triggerUserOutboundEvent(r, promise: nil)
     }
     func disconnect() async {
+        timeoutWork?.cancel(); timeoutWork = nil
         if let c = child { try? await c.close().get() }
         if let p = parent { try? await p.close().get() }
         if let g = group { try? await g.shutdownGracefully() }
@@ -271,14 +406,11 @@ class SSHManager: ObservableObject {
 
 // MARK: - SwiftTerm 终端桥接
 extension Terminal {
-    // 修复文本提取逻辑：确保一定能抓到内容
     func getAllText() -> String {
         var r = ""
         let buffer = self.buffer
         for i in 0..<buffer.lines.count {
-            if let line = buffer.lines[i] {
-                r += line.translateToString() + "\n"
-            }
+            if let line = buffer.lines[i] { r += line.translateToString() + "\n" }
         }
         return r
     }
@@ -300,22 +432,24 @@ final class TerminalBridge: NSObject, TerminalViewDelegate {
     func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {}
 }
 
-// MARK: - 核心修复：自定义 TerminalView 子类，彻底阻止系统键盘
-class CustomTerminalView: TerminalView {
-    override func becomeFirstResponder() -> Bool {
-        if let _ = self.inputView as? UIView, self.inputView!.subviews.isEmpty {
-            // 如果 inputView 被设置为空 UIView，拒绝成为第一响应者
-            return false
-        }
-        return super.becomeFirstResponder()
-    }
-}
+// MARK: - 键盘互斥（三态严格管理）
+enum KeyboardMode { case custom, system, hidden }
 
-// MARK: - 键盘互斥核心逻辑
-enum KeyboardMode {
-    case custom
-    case system
-    case hidden
+class CustomTerminalView: TerminalView {
+    var allowSystemKeyboard: Bool = false {
+        didSet {
+            guard oldValue != allowSystemKeyboard else { return }
+            if allowSystemKeyboard {
+                self.inputView = nil
+                self.reloadInputViews()
+                if !self.isFirstResponder { _ = self.becomeFirstResponder() }
+            } else {
+                self.inputView = UIView()
+                self.reloadInputViews()
+                if self.isFirstResponder { self.resignFirstResponder() }
+            }
+        }
+    }
 }
 
 struct TerminalWrapper: UIViewRepresentable {
@@ -330,39 +464,26 @@ struct TerminalWrapper: UIViewRepresentable {
         v.backgroundColor = UIColor(Theme.bg)
         v.nativeBackgroundColor = UIColor(Theme.bg)
         v.nativeForegroundColor = UIColor(Theme.text)
-        
-        // 👈 字体优化：改用 Menlo，解决发虚，英文代码极其锐利
+        // 字体标准设计：Menlo 14 英文清晰锐利，中文字号自适应
         v.font = UIFont(name: "Menlo", size: 14) ?? UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
-        
-        // 👈 初始状态：彻底阻止系统键盘
         v.inputView = UIView()
-        
+
         ssh.onData = { [weak v] d in
             guard let v = v else { return }
             DispatchQueue.main.async { v.feed(byteArray: [UInt8](d)[...]) }
         }
         bridge.onInput = { [weak ssh] d in ssh?.send(d) }
         bridge.onResize = { [weak ssh] c, r in ssh?.resize(cols: c, rows: r) }
-        
+
         DispatchQueue.main.async {
             let d = v.getTerminal().getDims()
             ssh.resize(cols: d.cols, rows: d.rows)
         }
         return v
     }
-    
+
     func updateUIView(_ v: CustomTerminalView, context: Context) {
-        if keyboardMode == .system {
-            // 允许系统键盘：清除空 inputView，重新获得焦点
-            v.inputView = nil
-            v.reloadInputViews()
-            if !v.isFirstResponder { v.becomeFirstResponder() }
-        } else {
-            // 自定义或隐藏模式：强制交出焦点，并设置空 inputView
-            v.inputView = UIView()
-            v.reloadInputViews()
-            if v.isFirstResponder { v.resignFirstResponder() }
-        }
+        v.allowSystemKeyboard = (keyboardMode == .system)
     }
 }
 
@@ -377,7 +498,7 @@ struct SessionListView: View {
     @State var editing: Session?
     @State var isNew = false
     @State var showShortcuts = false
-    
+
     var body: some View {
         ZStack {
             Theme.bg.ignoresSafeArea()
@@ -397,7 +518,7 @@ struct SessionListView: View {
                             .frame(width: 40, height: 40).background(Circle().fill(Theme.blue))
                     }
                 }.padding()
-                
+
                 if store.sessions.isEmpty {
                     Spacer()
                     Text("还没有会话").foregroundColor(Theme.textDim)
@@ -406,9 +527,7 @@ struct SessionListView: View {
                     ScrollView {
                         LazyVStack(spacing: 10) {
                             ForEach(store.sessions) { s in
-                                NavigationLink {
-                                    TerminalScreen(session: s)
-                                } label: {
+                                NavigationLink { TerminalScreen(session: s) } label: {
                                     HStack {
                                         Text(s.shortName).font(.headline).foregroundColor(Theme.text)
                                         Spacer()
@@ -437,7 +556,7 @@ struct ShortcutEditView: View {
     @Environment(\.dismiss) var dismiss
     @State var newName = ""
     @State var newCmd = ""
-    
+
     var body: some View {
         NavigationStack {
             List {
@@ -502,7 +621,7 @@ struct TerminalScreen: View {
     let session: Session
     @EnvironmentObject var shortcutStore: ShortcutStore
     @Environment(\.dismiss) var dismiss
-    
+
     @StateObject private var ssh: SSHService
     @State private var bridge = TerminalBridge()
     @State private var toast: String?
@@ -510,12 +629,12 @@ struct TerminalScreen: View {
     @State private var rawText: String = ""
     @State private var showShortcuts = false
     @State private var keyboardMode: KeyboardMode = .custom
-    
+
     init(session: Session) {
         self.session = session
         _ssh = StateObject(wrappedValue: SSHManager.shared.service(for: session))
     }
-    
+
     var body: some View {
         ZStack {
             Theme.bg.ignoresSafeArea()
@@ -534,7 +653,7 @@ struct TerminalScreen: View {
                 }
                 .padding(.horizontal, 12).padding(.vertical, 10)
                 .background(Color.black.opacity(0.8))
-                
+
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         Button { showShortcuts = true } label: {
@@ -553,18 +672,15 @@ struct TerminalScreen: View {
                 }
                 .background(Color.black.opacity(0.5))
                 .sheet(isPresented: $showShortcuts) { ShortcutEditView().environmentObject(shortcutStore) }
-                
+
                 ZStack {
                     TerminalWrapper(ssh: ssh, bridge: bridge, keyboardMode: $keyboardMode)
                         .background(Theme.bg)
-                    
                     if keyboardMode == .hidden {
-                        Color.clear.contentShape(Rectangle()).onTapGesture {
-                            keyboardMode = .custom
-                        }
+                        Color.clear.contentShape(Rectangle()).onTapGesture { keyboardMode = .custom }
                     }
                 }
-                
+
                 if keyboardMode == .custom {
                     CustomKeyPanel(
                         onKey: { ssh.send($0) },
@@ -595,9 +711,7 @@ struct TerminalScreen: View {
             }
         }
         .navigationBarBackButtonHidden(true).toolbar(.hidden, for: .navigationBar).overlay(alignment: .top) { toastView }
-        .sheet(isPresented: $showLog) {
-            BufferSheet(rawText: rawText)
-        }
+        .sheet(isPresented: $showLog) { BufferSheet(rawText: rawText) }
         .task {
             let pw = KeychainHelper.read(account: "session.\(session.id.uuidString).password") ?? ""
             if !ssh.isConnected { await ssh.connect(session: session, password: pw) }
@@ -607,7 +721,7 @@ struct TerminalScreen: View {
             if keyboardMode == .system { keyboardMode = .custom }
         }
     }
-    
+
     private var toastView: some View {
         Group {
             if let toast = toast {
@@ -617,20 +731,11 @@ struct TerminalScreen: View {
             }
         }.animation(.spring(response: 0.3), value: toast)
     }
-    
-    // 👈 彻底重写抓取逻辑，多重保障，绝不再返回空数据
+
     private func collectAndOpen() {
-        guard let v = bridge.terminalView else {
-            rawText = "无法获取终端内容"
-            showLog = true
-            return
-        }
+        guard let v = bridge.terminalView else { rawText = "无法获取终端内容"; showLog = true; return }
         let text = v.getTerminal().getAllText()
-        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            rawText = "终端暂无输出"
-        } else {
-            rawText = text
-        }
+        rawText = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "终端暂无输出" : text
         showLog = true
     }
 }
@@ -645,14 +750,12 @@ struct BufferSheet: View {
         NavigationStack {
             ZStack {
                 Theme.bg.ignoresSafeArea()
-                // 👈 修复空数据显示问题
                 if rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || blocks.isEmpty {
                     Text("终端暂无输出").foregroundColor(Theme.textDim)
                 } else {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 12) {
                             ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                                // 过滤掉空块
                                 if !block.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                                     VStack(alignment: .leading, spacing: 8) {
                                         HStack {
@@ -691,18 +794,10 @@ struct BufferSheet: View {
             .navigationTitle("输出历史 / 整段复制")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("关闭") { dismiss() }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("复制全部") {
-                        UIPasteboard.general.string = rawText
-                    }
-                }
+                ToolbarItem(placement: .topBarLeading) { Button("关闭") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) { Button("复制全部") { UIPasteboard.general.string = rawText } }
             }
-            .onAppear {
-                parseBlocks()
-            }
+            .onAppear { parseBlocks() }
         }
         .preferredColorScheme(.dark)
     }
@@ -711,14 +806,10 @@ struct BufferSheet: View {
         let lines = rawText.split(separator: "\n", omittingEmptySubsequences: false)
         var current = ""
         var result: [String] = []
-
         for line in lines {
             let lineStr = String(line)
             if lineStr.contains("root@") && (lineStr.contains("#") || lineStr.contains("$")) {
-                if !current.isEmpty {
-                    result.append(current)
-                    current = ""
-                }
+                if !current.isEmpty { result.append(current); current = "" }
             }
             current += lineStr + "\n"
         }
@@ -728,17 +819,18 @@ struct BufferSheet: View {
     }
 }
 
+// MARK: - 自定义底部键盘（完全保持你的要求）
 struct CustomKeyPanel: View {
     let onKey: (Data) -> Void
     let onText: (String) -> Void
     let onHide: () -> Void
     let onSwitchToSystem: () -> Void
-    
+
     let leftKeys: [[String]] = [
         ["1","2","3","4","5","k"],
         ["6","7","8","9","0","-"]
     ]
-    
+
     var body: some View {
         VStack(spacing: 4) {
             HStack(spacing: 8) {
@@ -748,9 +840,9 @@ struct CustomKeyPanel: View {
                         .padding(.horizontal, 12).padding(.vertical, 6)
                         .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.3)))
                 }.buttonStyle(.plain)
-                
+
                 Spacer()
-                
+
                 Button { onSwitchToSystem() } label: {
                     HStack(spacing: 4) { Image(systemName: "keyboard"); Text("系统键盘") }
                         .font(.system(size: 13, weight: .medium)).foregroundColor(Theme.orange)
@@ -759,7 +851,7 @@ struct CustomKeyPanel: View {
                 }.buttonStyle(.plain)
             }
             .padding(.horizontal, 8).padding(.top, 6)
-            
+
             HStack(alignment: .top, spacing: 6) {
                 VStack(spacing: 4) {
                     ForEach(leftKeys.indices, id: \.self) { idx in
@@ -773,7 +865,7 @@ struct CustomKeyPanel: View {
                             }
                         }
                     }
-                    
+
                     HStack(spacing: 4) {
                         Button { onKey(Data([0x03])) } label: {
                             Text("Ctrl+C").font(.system(size: 12, weight: .medium)).foregroundColor(.white)
@@ -796,16 +888,16 @@ struct CustomKeyPanel: View {
                                 .background(RoundedRectangle(cornerRadius: 5).fill(Color.gray.opacity(0.25)))
                         }.buttonStyle(.plain)
                     }
-                    
+
                     HStack(spacing: 4) {
                         Button { onText("x-ui") } label: { keyButtonLabel("x-ui", color: Color.gray.opacity(0.25)) }
                         Button { onText("88") } label: { keyButtonLabel("88", color: Color.gray.opacity(0.25)) }
                         Button { onText("q") } label: { keyButtonLabel("q退出", color: Theme.magenta) }
                     }
                 }
-                
+
                 VStack(spacing: 4) {
-                    Button { 
+                    Button {
                         if let str = UIPasteboard.general.string { onText(str) }
                     } label: {
                         VStack(spacing: 4) {
@@ -816,7 +908,7 @@ struct CustomKeyPanel: View {
                         .frame(width: 80, height: 56)
                         .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blue))
                     }.buttonStyle(.plain)
-                    
+
                     Button { onKey(Data([0x0D])) } label: {
                         VStack(spacing: 4) {
                             Image(systemName: "return")
@@ -833,7 +925,7 @@ struct CustomKeyPanel: View {
         .background(Color(red: 0.06, green: 0.09, blue: 0.15))
         .overlay(Rectangle().frame(height: 1).foregroundColor(Theme.stroke), alignment: .top)
     }
-    
+
     private func keyButtonLabel(_ title: String, color: Color) -> some View {
         Text(title).font(.system(size: 12, weight: .medium)).foregroundColor(.white)
             .frame(maxWidth: .infinity).padding(.vertical, 8)
