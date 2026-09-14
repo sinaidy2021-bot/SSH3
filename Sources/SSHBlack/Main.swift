@@ -11,16 +11,16 @@ import SwiftTerm
 
 typealias Color = SwiftUI.Color
 
-// MARK: - 字体：注册内置思源等宽，查找时多重兜底
+// MARK: - 字体：注册内置 Sarasa Mono SC（中英文等宽），查找时多重兜底
 enum FontLoader {
     static func registerFonts() {
-        guard let urls = Bundle.main.urls(forResourcesWithExtension: "otf", subdirectory: nil) else { return }
+        guard let urls = Bundle.main.urls(forResourcesWithExtension: "ttf", subdirectory: nil) else { return }
         for url in urls {
             CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
         }
     }
     static func monoFont(size: CGFloat) -> UIFont {
-        let names = ["SourceHanMonoSC-Regular", "SourceHanMonoSC", "Source Han Mono SC"]
+        let names = ["SarasaMonoSC-Regular", "SarasaMonoSC", "Sarasa Mono SC"]
         for n in names {
             if let f = UIFont(name: n, size: size) { return f }
         }
@@ -544,11 +544,9 @@ struct TerminalScreen: View {
                         Text(ssh.statusText).font(.caption2.monospaced()).foregroundColor(Theme.textDim).lineLimit(1)
                     }
                     Spacer()
-                    // 收起键盘（常驻）
                     Button { keyboardMode = .hidden } label: {
                         Image(systemName: "keyboard.chevron.compact.down").font(.system(size: 15, weight: .semibold)).foregroundColor(Theme.blue).padding(8).background(Circle().fill(Theme.blueSoft))
                     }
-                    // 复制
                     Button { showLog = true } label: {
                         Image(systemName: "doc.text.magnifyingglass").font(.system(size: 15, weight: .semibold)).foregroundColor(Theme.blue).padding(8).background(Circle().fill(Theme.blueSoft))
                     }
@@ -594,17 +592,16 @@ struct TerminalScreen: View {
                     HStack {
                         Button { keyboardMode = .custom } label: {
                             HStack(spacing: 4) { Image(systemName: "keyboard"); Text("微缩键盘") }
-                                .font(.system(size:: 13, weight: .medium)).foregroundColor(Theme. blue)
-                                .padding(.horizontal, 12).padding(.vertical, 84).background(RoundedRectangle(cornerRadius: 8).fill(Theme.blueSoft)))
+                                .font(.system(size: 13, weight: .medium)).foregroundColor(Theme.blue)
+                                .padding(.horizontal, 12).padding(.vertical, 8).background(RoundedRectangle(cornerRadius: 8).fill(Theme.blueSoft))
                         }
                         Spacer()
                         Text("已在线").font(.caption).foregroundColor(Theme.textDim)
                         Spacer()
                         Button { ssh.commitInput() } label: {
-                            Text("回车").font(.system {
-(size: 14, weight: .bold)).foregroundColor(.white)
+                            Text("回车").font(.system(size: 14, weight: .bold)).foregroundColor(.white)
                                 .padding(.horizontal, 20).padding(.vertical, 8).background(RoundedRectangle(cornerRadius: 8).fill(Theme.blue))
-                                   }
+                        }
                     }.padding(.horizontal, 8).padding(.vertical, 6).background(Color.black.opacity(0.8))
                 }
             }
@@ -638,7 +635,6 @@ struct CommandHistorySheet: View {
                                     HStack {
                                         Text("$ \(rec.command)").font(.caption).foregroundColor(Theme.textDim).lineLimit(1)
                                         Spacer()
-                                        // 复制整段（命令+输出）
                                         Button {
                                             UIPasteboard.general.string = "$ \(rec.command)\n\(rec.output)"
                                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -647,7 +643,6 @@ struct CommandHistorySheet: View {
                                                 .font(.caption).foregroundColor(Theme.blue)
                                                 .padding(.horizontal, 8).padding(.vertical, 4).background(RoundedRectangle(cornerRadius: 6).fill(Theme.blueSoft))
                                         }
-                                        // 只复制输出
                                         Button {
                                             UIPasteboard.general.string = rec.output
                                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -678,7 +673,7 @@ struct CommandHistorySheet: View {
     }
 }
 
-// MARK: - 自定义键盘（完全照截图布局）
+// MARK: - 自定义键盘
 struct CustomKeyPanel: View {
     let onInput: (String) -> Void
     let onBackspace: () -> Void
@@ -691,7 +686,7 @@ struct CustomKeyPanel: View {
     let onSwitchToSystem: () -> Void
 
     var body: some View {
-        VStack(spacing // 第一行：收起 | 系统键盘 | 已连接
+        VStack(spacing: 4) {
             HStack(spacing: 6) {
                 Button { onHide() } label: {
                     HStack(spacing: 4) { Image(systemName: "keyboard.chevron.compact.down"); Text("收起") }
@@ -707,7 +702,6 @@ struct CustomKeyPanel: View {
                 Text("已连接").font(.system(size: 12, weight: .medium)).foregroundColor(Theme.green)
             }.padding(.horizontal, 8).padding(.top, 6)
 
-            // 第二行：已在线 | 1 2 3 4 5 k | 粘贴
             HStack(alignment: .top, spacing: 6) {
                 VStack(spacing: 4) {
                     Text("已在线").font(.system(size: 12)).foregroundColor(Theme.textDim).frame(maxWidth: .infinity, alignment: .leading)
@@ -721,7 +715,6 @@ struct CustomKeyPanel: View {
                             Button { onInput(k) } label: { keyLabel(k) }.buttonStyle(.plain)
                         }
                     }
-                    // Ctrl+C | ESC | 空格 | 退格
                     HStack(spacing: 4) {
                         Button { onCtrlC() } label: {
                             Text("Ctrl+C").font(.system(size: 12, weight: .medium)).foregroundColor(.white)
@@ -740,14 +733,12 @@ struct CustomKeyPanel: View {
                                 .frame(maxWidth: .infinity).padding(.vertical, 8).background(RoundedRectangle(cornerRadius: 5).fill(Color.gray.opacity(0.25)))
                         }.buttonStyle(.plain)
                     }
-                    // x-ui | 88 | q退出
                     HStack(spacing: 4) {
                         Button { onShortcut("x-ui") } label: { customKeyLabel("x-ui", color: Color.gray.opacity(0.25)) }.buttonStyle(.plain)
                         Button { onShortcut("88") } label: { customKeyLabel("88", color: Color.gray.opacity(0.25)) }.buttonStyle(.plain)
                         Button { onShortcut("q") } label: { customKeyLabel("q退出", color: Theme.magenta) }.buttonStyle(.plain)
                     }
                 }
-                // 右侧：粘贴 / 回车
                 VStack(spacing: 4) {
                     Button { onPaste() } label: {
                         VStack(spacing: 4) { Image(systemName: "doc.on.clipboard"); Text("粘贴").font(.system(size: 12, weight: .medium)) }
