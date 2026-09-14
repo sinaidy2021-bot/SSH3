@@ -10,13 +10,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 下载思源等宽字体（仅 Regular）
+      - name: 下载 Sarasa Mono SC（中英文等宽字体）
         run: |
+          set -e
           mkdir -p Sources/SSHBlack/Fonts
-          curl -fL -o Sources/SSHBlack/Fonts/SourceHanMonoSC-Regular.otf \
-            "https://github.com/adobe-fonts/source-han-mono/raw/release/OTF/SimplifiedChinese/SourceHanMonoSC-Regular.otf"
-          echo "👉 字体文件："
+          echo "👉 安装 p7zip..."
+          brew install p7zip || brew install sevenzip
+          echo "👉 下载 Sarasa Mono SC 字体包..."
+          curl -fL -o /tmp/sarasa.7z \
+            "https://github.com/be5invis/Sarasa-Gothic/releases/download/v1.0.29/SarasaMonoSC-TTF-1.0.29.7z"
+          echo "👉 下载完成，大小："
+          ls -la /tmp/sarasa.7z
+          echo "👉 解压..."
+          7z x /tmp/sarasa.7z -o/tmp/sarasa/ -y > /dev/null
+          echo "👉 查找 Regular 字体文件..."
+          find /tmp/sarasa -name "SarasaMonoSC-Regular.ttf" -exec cp {} Sources/SSHBlack/Fonts/ \;
+          echo "👉 字体文件列表："
           ls -la Sources/SSHBlack/Fonts/
+          if [ ! -f Sources/SSHBlack/Fonts/SarasaMonoSC-Regular.ttf ]; then
+            echo "❌ 字体文件未找到，列出解压目录内容排查："
+            find /tmp/sarasa -name "*.ttf" | head -n 20
+            exit 1
+          fi
 
       - name: 安装 XcodeGen
         run: brew install xcodegen
@@ -50,7 +65,6 @@ jobs:
             echo "========================================"
             grep -n -B 3 -A 3 "error:" build_log.txt | tail -n 120
             echo "========================================"
-            echo "👉 请截图以上内容"
             exit 1
           fi
 
