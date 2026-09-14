@@ -7,9 +7,10 @@ options:
   createIntermediateGroups: true
 
 packages:
-  swift-nio-ssh:
-    url: https://github.com/apple/swift-nio-ssh.git
-    exactVersion: "0.15.0"
+  Citadel:
+    url: https://github.com/orlandos-nl/Citadel.git
+    branch: main
+
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm.git
     exactVersion: "1.2.0"
@@ -18,8 +19,10 @@ targets:
   SSHBlack:
     type: application
     platform: iOS
+
     sources:
       - Sources/SSHBlack
+
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.sshblack
@@ -29,14 +32,17 @@ targets:
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_KEY_CFBundleDisplayName: "SSH Black"
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: "YES"
         INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
         INFOPLIST_KEY_UIStatusBarStyle: "UIStatusBarStyleLightContent"
         INFOPLIST_KEY_UIUserInterfaceStyle: "Dark"
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         TARGETED_DEVICE_FAMILY: "1,2"
+
     dependencies:
-      - package: swift-nio-ssh
-        product: NIOSSH
+      - package: Citadel
+        product: Citadel
+
       - package: SwiftTerm
         product: SwiftTerm
 
@@ -45,7 +51,9 @@ schemes:
     build:
       targets:
         SSHBlack: all
+
     run:
       config: Debug
+
     archive:
       config: Release
