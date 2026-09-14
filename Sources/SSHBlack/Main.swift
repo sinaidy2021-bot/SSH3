@@ -1113,7 +1113,7 @@ struct TerminalView: View {
 
         LazyVStack(alignment: .leading, spacing: 2) {
             if isTruncated {
-                Text("⚠️ 输出过长（共 \(allLines.count) 行），仅显示最后 \(maxRenderedLinesPerBlock) 行。点击“复制整段”可获取已接收内容。")
+                Text("⚠️ 输出过长（共 \(allLines.count) 行），仅显示最后 \(maxRenderedLinesPerBlock) 行。点击"复制整段"可获取已接收内容。")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(.orange)
                     .padding(.bottom, 2)
@@ -1390,6 +1390,67 @@ struct TerminalView: View {
             UserDefaults.standard.set(
                 encoded,
                 forKey: storageKey
+            )
+        }
+    }
+}
+
+
+// MARK: - App 入口
+// 之前 "_main" 链接错误的根本原因：项目里没有任何 @main 入口，
+// 导致编译器不知道程序从哪里启动。直接加在这里，不需要拆文件。
+@main
+struct SSHBlackApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ServerConnectView()
+        }
+    }
+}
+
+// 简易连接表单作为启动页。如果你已经有自己的服务器列表页面，
+// 把下面 body 里的 ServerConnectView() 换成你自己的根视图就行。
+struct ServerConnectView: View {
+    @State private var serverName = "服务器"
+    @State private var host = ""
+    @State private var port = "22"
+    @State private var username = "root"
+    @State private var password = ""
+    @State private var showTerminal = false
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section(header: Text("服务器信息")) {
+                    TextField("名称", text: $serverName)
+                    TextField("主机 / IP", text: $host)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                    TextField("端口", text: $port)
+                        .keyboardType(.numberPad)
+                    TextField("用户名", text: $username)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                    SecureField("密码", text: $password)
+                }
+
+                Button("连接") {
+                    showTerminal = true
+                }
+                .disabled(host.isEmpty || password.isEmpty)
+            }
+            .navigationTitle("SSH Black")
+            .background(
+                NavigationLink(
+                    destination: TerminalView(
+                        serverName: serverName,
+                        host: host,
+                        port: Int(port) ?? 22,
+                        username: username,
+                        password: password
+                    ),
+                    isActive: $showTerminal
+                ) { EmptyView() }
             )
         }
     }
