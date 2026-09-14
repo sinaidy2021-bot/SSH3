@@ -26,7 +26,6 @@ enum Theme {
 
 // MARK: - 终端输出自动着色引擎
 enum TerminalColorizer {
-    // ANSI 转义码
     static let reset       = "\u{1B}[0m"
     static let red         = "\u{1B}[31m"
     static let green       = "\u{1B}[32m"
@@ -35,57 +34,35 @@ enum TerminalColorizer {
     static let cyan        = "\u{1B}[36m"
     static let underline   = "\u{1B}[4m"
 
-    // 关键词（小写匹配）
     static let errorKeywords   = ["error", "failed", "fail", "fatal", "denied", "refused", "exception"]
     static let successKeywords = ["success", "ok", "done", "complete", "finished", "running"]
     static let warnKeywords    = ["warning", "warn", "deprecated"]
 
-    /// 对一段纯文本做高亮，不改变字符数（ANSI 码会被终端解析，不占显示宽度）
     static func colorize(_ text: String) -> String {
-        // 如果这段文本里已经包含 ANSI 转义，说明服务器自己上色了，不干预
         if text.contains("\u{1B}[") { return text }
 
-        var result = text
-
-        // 逐行处理，避免跨行误匹配
-        let lines = result.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         var newLines: [String] = []
 
         for line in lines {
-            if line.isEmpty {
-                newLines.append(line)
-                continue
-            }
-
+            if line.isEmpty { newLines.append(line); continue }
             let lower = line.lowercased()
             var colored = line
 
-            // 1. 错误关键词 → 红
             if errorKeywords.contains(where: { lower.contains($0) }) {
                 colored = red + line + reset
-            }
-            // 2. 成功关键词 → 绿
-            else if successKeywords.contains(where: { lower.contains($0) }) {
+            } else if successKeywords.contains(where: { lower.contains($0) }) {
                 colored = green + line + reset
-            }
-            // 3. 警告关键词 → 黄
-            else if warnKeywords.contains(where: { lower.contains($0) }) {
+            } else if warnKeywords.contains(where: { lower.contains($0) }) {
                 colored = yellow + line + reset
-            }
-            // 4. IPv4 地址 → 青
-            else if line.range(of: #"\b(?:\d{1,3}\.){3}\d{1,3}\b"#, options: .regularExpression) != nil {
+            } else if line.range(of: #"\b(?:\d{1,3}\.){3}\d{1,3}\b"#, options: .regularExpression) != nil {
                 colored = cyan + line + reset
-            }
-            // 5. URL → 蓝 + 下划线
-            else if line.contains("http://") || line.contains("https://") {
+            } else if line.contains("http://") || line.contains("https://") {
                 colored = blue + underline + line + reset
             }
-
             newLines.append(colored)
         }
-
-        result = newLines.joined(separator: "\n")
-        return result
+        return newLines.joined(separator: "\n")
     }
 }
 
@@ -300,7 +277,8 @@ class SSHService: ObservableObject, Identifiable {
                     guard let self = self, self.isFiltering else { return }
                     self.isFiltering = false
                     if !self.initialBuffer.isEmpty {
-                        if let d = self.initialBuffer.data(using: .utf8) { self.onData?(d) }
+                        let colored = TerminalColorizer.colorize(self.initialBuffer)
+                        if let d = colored.data(using: .utf8) { self.onData?(d) }
                         self.initialBuffer = ""
                     }
                 }
@@ -332,9 +310,8 @@ class SSHService: ObservableObject, Identifiable {
                                     self.isFiltering = false
                                     self.timeoutWork?.cancel()
                                     let keep = String(self.initialBuffer[range.lowerBound...])
-                                    if let keepData = keep.data(using: .utf8) {
-                                        self.onData?(Data(TerminalColorizer.colorize(String(decoding: keepData, as: UTF8.self)).utf8))
-                                    }
+                                    let colored = TerminalColorizer.colorize(keep)
+                                    if let keepData = colored.data(using: .utf8) { self.onData?(keepData) }
                                     self.initialBuffer = ""
                                 }
                             } else {
@@ -342,7 +319,6 @@ class SSHService: ObservableObject, Identifiable {
                                 self.onData?(d)
                             }
                         } else {
-                            // 👈 核心：把数据做自动着色后再投递给终端
                             if let str = String(data: d, encoding: .utf8) {
                                 let colored = TerminalColorizer.colorize(str)
                                 self.onData?(Data(colored.utf8))
@@ -404,13 +380,14 @@ class SSHManager: ObservableObject {
     }
 }
 
-// MARK: - SwiftTerm 终端桥接
+// MARK: - SwiftTerm 终端桥接（修复：使用 getLine(row:) 访问可见行）
 extension Terminal {
-    func getAllText() -> String {
+    func getVisibleText() -> String {
         var r = ""
-        let buffer = self.buffer
-        for i in 0..<buffer.lines.count {
-            if let line = buffer.lines[i] { r += line.translateToString() + "\n" }
+        for y in 0..<self.rows {
+            if let line = self.getLine(row: y) {
+                r += line.translateToString() + "\n"
+            }
         }
         return r
     }
@@ -464,7 +441,6 @@ struct TerminalWrapper: UIViewRepresentable {
         v.backgroundColor = UIColor(Theme.bg)
         v.nativeBackgroundColor = UIColor(Theme.bg)
         v.nativeForegroundColor = UIColor(Theme.text)
-        // 字体标准设计：Menlo 14 英文清晰锐利，中文字号自适应
         v.font = UIFont(name: "Menlo", size: 14) ?? UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
         v.inputView = UIView()
 
@@ -734,7 +710,7 @@ struct TerminalScreen: View {
 
     private func collectAndOpen() {
         guard let v = bridge.terminalView else { rawText = "无法获取终端内容"; showLog = true; return }
-        let text = v.getTerminal().getAllText()
+        let text = v.getTerminal().getVisibleText()
         rawText = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "终端暂无输出" : text
         showLog = true
     }
@@ -819,7 +795,7 @@ struct BufferSheet: View {
     }
 }
 
-// MARK: - 自定义底部键盘（完全保持你的要求）
+// MARK: - 自定义底部键盘
 struct CustomKeyPanel: View {
     let onKey: (Data) -> Void
     let onText: (String) -> Void
