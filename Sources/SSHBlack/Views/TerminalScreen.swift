@@ -11,7 +11,6 @@ struct TerminalScreen: View {
     @State private var toast: String?
     @State private var showBufferSheet = false
     @State private var bufferLines: [String] = []
-    @State private var keyboardVisible = false
 
     var body: some View {
         ZStack {
@@ -45,8 +44,6 @@ struct TerminalScreen: View {
             Task { await ssh.disconnect() }
         }
     }
-
-    // MARK: - 顶部状态条
 
     private var statusBar: some View {
         HStack(spacing: 10) {
@@ -104,28 +101,25 @@ struct TerminalScreen: View {
         )
     }
 
-    // MARK: - 终端区域
-
     private var terminalArea: some View {
         TerminalViewWrapper(ssh: ssh, bridge: bridge)
             .background(Theme.bg)
     }
 
-    // MARK: - 底部工具条
-
     private var bottomToolbar: some View {
         HStack(spacing: 10) {
-            toolButton(icon: "doc.on.doc.fill", title: "复制屏幕", tint: Theme.neon) {
+            // 👇 修复：使用 SwiftUI.Color
+            toolButton(icon: "doc.on.doc.fill", title: "复制屏幕", tint: SwiftUI.Color(Theme.neon)) {
                 copyScreen()
             }
-            toolButton(icon: "doc.on.clipboard", title: "粘贴", tint: Theme.violet) {
+            toolButton(icon: "doc.on.clipboard", title: "粘贴", tint: SwiftUI.Color(Theme.violet)) {
                 pasteFromClipboard()
             }
-            toolButton(icon: "eraser.fill", title: "清屏", tint: Theme.magenta) {
-                ssh.send(Data([0x0C])) // Ctrl+L
+            toolButton(icon: "eraser.fill", title: "清屏", tint: SwiftUI.Color(Theme.magenta)) {
+                ssh.send(Data([0x0C]))
             }
             Spacer()
-            toolButton(icon: "keyboard", title: "键盘", tint: Theme.neon) {
+            toolButton(icon: "keyboard", title: "键盘", tint: SwiftUI.Color(Theme.neon)) {
                 UIApplication.shared.sendAction(
                     #selector(UIResponder.becomeFirstResponder),
                     to: nil, from: nil, for: nil
@@ -144,7 +138,7 @@ struct TerminalScreen: View {
     private func toolButton(
         icon: String,
         title: String,
-        tint: Color,
+        tint: SwiftUI.Color,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
@@ -167,8 +161,6 @@ struct TerminalScreen: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: - Toast
-
     private var toastView: some View {
         Group {
             if let toast {
@@ -177,9 +169,7 @@ struct TerminalScreen: View {
                     .foregroundColor(.black)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 8)
-                    .background(
-                        Capsule().fill(Theme.neon)
-                    )
+                    .background(Capsule().fill(Theme.neon))
                     .shadow(color: Theme.neon.opacity(0.5), radius: 10)
                     .padding(.top, 60)
                     .transition(.move(edge: .top).combined(with: .opacity))
@@ -188,14 +178,13 @@ struct TerminalScreen: View {
         .animation(.spring(response: 0.3), value: toast)
     }
 
-    // MARK: - 逻辑
-
     private func copyScreen() {
         guard let view = bridge.terminalView else {
             showToast("暂无可复制内容")
             return
         }
-        let text = view.getTerminal().getBufferAsString()
+        // 👇 修复：改用我们自己的方法
+        let text = view.getTerminal().getVisibleText()
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             showToast("屏幕为空")
             return
@@ -217,7 +206,7 @@ struct TerminalScreen: View {
             showToast("暂无可复制内容")
             return
         }
-        let raw = view.getTerminal().getBufferAsString()
+        let raw = view.getTerminal().getVisibleText()
         bufferLines = raw
             .split(separator: "\n", omittingEmptySubsequences: false)
             .map { String($0).trimmingCharacters(in: .whitespaces) }
@@ -238,8 +227,6 @@ struct TerminalScreen: View {
         }
     }
 }
-
-// MARK: - 输出历史面板
 
 struct BufferSheet: View {
     let lines: [String]
