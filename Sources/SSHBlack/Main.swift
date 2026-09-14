@@ -1,1075 +1,1396 @@
-import SwiftUI
 import Foundation
 import UIKit
-import Security
-import Crypto
-import CoreText
+import Combine
+import Citadel
 import NIOCore
-import NIOPosix
 import NIOSSH
-import SwiftTerm
 
-typealias Color = SwiftUI.Color
+public struct CommandHistoryItem: Identifiable {
+    public let id: UUID
+    public let command: String
+    public var output: String
 
-// MARK: - 字体
-enum FontLoader {
-    static func registerFonts() {
-        guard let urls = Bundle.main.urls(forResourcesWithExtension: "ttf", subdirectory: nil) else { return }
-        for url in urls { CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil) }
-    }
-    static func monoFont(size: CGFloat) -> UIFont {
-        for n in ["SarasaMonoSC-Regular", "SarasaMonoSC", "Sarasa Mono SC"] {
-            if let f = UIFont(name: n, size: size) { return f }
-        }
-        return UIFont.monospacedSystemFont(ofSize: size, weight: .regular)
-    }
-}
+    // 记录执行该命令时真实的 shell 提示符。
+    public let prompt: String
 
-// MARK: - 主题
-enum Theme {
-    static let blue = Color(red: 0.00, green: 0.48, blue: 1.00)
-    static let blueSoft = Color(red: 0.00, green: 0.48, blue: 1.00).opacity(0.15)
-    static let bg = Color(red: 0.02, green: 0.04, blue: 0.08)
-    static let bgElev = Color(red: 0.06, green: 0.09, blue: 0.15)
-    static let stroke = Color.white.opacity(0.08)
-    static let text = Color.white.opacity(0.92)
-    static let textDim = Color.white.opacity(0.55)
-    static let red = Color(red: 1.00, green: 0.30, blue: 0.30)
-    static let orange = Color(red: 1.00, green: 0.58, blue: 0.00)
-    static let magenta = Color(red: 1.00, green: 0.40, blue: 0.80)
-    static let green = Color(red: 0.20, green: 0.85, blue: 0.40)
-}
-
-// MARK: - 命令历史
-struct CommandRecord: Identifiable {
-    let id = UUID()
-    var command: String
-    var output: String = ""
-}
-
-// MARK: - ANSI 处理
-enum TerminalColorizer {
-    static let reset = "\u{1B}[0m"
-    static let red = "\u{1B}[31m"
-    static let green = "\u{1B}[32m"
-    static let yellow = "\u{1B}[33m"
-    static let blue = "\u{1B}[34m"
-    static let cyan = "\u{1B}[36m"
-    static let underline = "\u{1B}[4m"
-    static let errorK = ["error","failed","fail","fatal","denied","refused","exception"]
-    static let successK = ["success","ok","done","complete","finished","running"]
-    static let warnK = ["warning","warn","deprecated"]
-
-    static func colorize(_ text: String) -> String {
-        if text.contains("\u{1B}[") { return text }
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        var out: [String] = []
-        for line in lines {
-            if line.isEmpty { out.append(line); continue }
-            let lower = line.lowercased()
-            var c = line
-            if errorK.contains(where: { lower.contains($0) }) { c = red + line + reset }
-            else if successK.contains(where: { lower.contains($0) }) { c = green + line + reset }
-            else if warnK.contains(where: { lower.contains($0) }) { c = yellow + line + reset }
-            else if line.range(of: #"\b(?:\d{1,3}\.){3}\d{1,3}\b"#, options: .regularExpression) != nil { c = cyan + line + reset }
-            else if line.contains("http://") || line.contains("https://") { c = blue + underline + line + reset }
-            out.append(c)
-        }
-        return out.joined(separator: "\n")
-    }
-
-    static func stripANSI(_ text: String) -> String {
-        var r = text
-        if let re = try? NSRegularExpression(pattern: "\u{1B}\\[[0-9;?]*[a-zA-Z]", options: []) {
-            r = re.stringByReplacingMatches(in: r, options: [], range: NSRange(r.startIndex..., in: r), withTemplate: "")
-        }
-        if let re = try? NSRegularExpression(pattern: "\u{1B}\\][^\u{07}]*\u{07}", options: []) {
-            r = re.stringByReplacingMatches(in: r, options: [], range: NSRange(r.startIndex..., in: r), withTemplate: "")
-        }
-        if let re = try? NSRegularExpression(pattern: "\u{1B}\\][^\u{1B}]*\u{1B}\\\\", options: []) {
-            r = re.stringByReplacingMatches(in: r, options: [], range: NSRange(r.startIndex..., in: r), withTemplate: "")
-        }
-        r = r.replacingOccurrences(of: "\u{07}", with: "")
-        r = r.replacingOccurrences(of: "\u{1B}", with: "")
-        r = r.replacingOccurrences(of: "\u{08}", with: "")
-        return r
-    }
-
-    static func normalizeCR(_ text: String) -> String {
-        let r = text.replacingOccurrences(of: "\r\n", with: "\n")
-        let lines = r.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        return lines.map { line -> String in
-            let parts = line.split(separator: "\r", omittingEmptySubsequences: false).map(String.init)
-            return parts.last ?? ""
-        }.joined(separator: "\n")
-    }
-
-    static func isPromptLine(_ line: String) -> Bool {
-        let pattern = #"^[\w\-\.]+@[\w\-\.]+:[^\s]*[#$]\s*$"#
-        return line.range(of: pattern, options: .regularExpression) != nil
-    }
-
-    static func cleanOutput(_ text: String) -> String {
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        var out: [String] = []
-        var lastPrompt: String? = nil
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if isPromptLine(trimmed) {
-                if let last = lastPrompt, last == trimmed { continue }
-                lastPrompt = trimmed
-            } else {
-                lastPrompt = nil
-            }
-            out.append(line)
-        }
-        return out.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    public init(command: String, output: String, prompt: String = "") {
+        self.id = UUID()
+        self.command = command
+        self.output = output
+        self.prompt = prompt
     }
 }
 
-// MARK: - 快捷指令
-struct Shortcut: Identifiable, Codable, Equatable {
-    var id = UUID()
-    var name: String
-    var command: String
-}
 
 @MainActor
-class ShortcutStore: ObservableObject {
-    @Published var shortcuts: [Shortcut] = []
-    private let key = "sshblack.shortcuts.v1"
-    init() { load() }
-    func load() {
-        guard let d = UserDefaults.standard.data(forKey: key), let l = try? JSONDecoder().decode([Shortcut].self, from: d) else {
-            shortcuts = [Shortcut(name:"输入 k 菜单",command:"k"),Shortcut(name:"面板管理 (x-ui)",command:"x-ui"),Shortcut(name:"查看文件 (ls)",command:"ls -la"),Shortcut(name:"磁盘空间",command:"df -h")]
+final class SSHSession: ObservableObject {
+    @Published var isConnected: Bool = false
+    @Published var history: [CommandHistoryItem] = []
+
+    // 当前真实 shell 提示符，例如 root@vps:~#
+    @Published private(set) var shellPrompt: String = ""
+
+    private var client: SSHClient?
+    private var activeWriter: TTYStdinWriter?
+
+    var host: String = ""
+    var port: Int = 22
+    var username: String = "root"
+    var password: String = ""
+
+    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    private var writeChain: Task<Void, Never>?
+
+    // MARK: - 输出批处理
+    // 大量输出时不要每个 SSH chunk 都触发 SwiftUI 重绘。
+    private var pendingOutput = ""
+    private var flushTask: Task<Void, Never>?
+
+    // MARK: - 多命令队列
+    // 每条命令单独保存，输出严格按发送顺序归属。
+    private struct PendingCommand {
+        let id: UUID
+        let command: String
+    }
+
+    private var pendingCommands: [PendingCommand] = []
+    private var activeInteractiveID: UUID?
+    private var interactivePromptBuffer = ""
+    private var markerBuffer = ""
+    private var truncatedIDs = Set<UUID>()
+
+    // 终端中用 shell marker 判断一条命令何时结束。
+    private var commandEndMarker = "__MYSSH_DONE_7F3A9C__"
+
+    // 防止单条命令超大输出拖垮 iPhone。
+    private let maxOutputCharactersPerCommand = 300_000
+
+    // 防止长期使用后历史无限增长。
+    private let maxHistoryItems = 120
+
+    // MARK: - ANSI 清理
+    private enum ANSIState { case normal, escape, csi, osc, oscEscape }
+    private var ansiState: ANSIState = .normal
+
+    private func cleanANSI(_ raw: String) -> String {
+        var result = ""
+        for scalar in raw.unicodeScalars {
+            let v = scalar.value
+            switch ansiState {
+            case .normal:
+                if v == 0x1B { ansiState = .escape }
+                else if v == 0x9B { ansiState = .csi }
+                else if v == 0x9D { ansiState = .osc }
+                else if v == 0x0D || v == 0x07 { }
+                else if v < 0x20 && v != 0x09 && v != 0x0A { }
+                else { result.unicodeScalars.append(scalar) }
+            case .escape:
+                if v == 0x5B { ansiState = .csi }
+                else if v == 0x5D { ansiState = .osc }
+                else if v == 0x1B { ansiState = .escape }
+                else { ansiState = .normal }
+            case .csi:
+                if v >= 0x40 && v <= 0x7E { ansiState = .normal }
+            case .osc:
+                if v == 0x07 { ansiState = .normal }
+                else if v == 0x1B { ansiState = .oscEscape }
+            case .oscEscape:
+                if v == 0x5C || v == 0x07 { ansiState = .normal }
+                else if v == 0x1B { ansiState = .oscEscape }
+                else { ansiState = .osc }
+            }
+        }
+        return result
+    }
+
+    // MARK: - 连接
+    func connect() {
+        guard !isConnected else { return }
+
+        flushTask?.cancel()
+        flushTask = nil
+        pendingOutput = ""
+        shellPrompt = ""
+        pendingCommands.removeAll()
+        activeInteractiveID = nil
+        interactivePromptBuffer = ""
+        markerBuffer = ""
+        truncatedIDs.removeAll()
+        ansiState = .normal
+        commandEndMarker = "__MYSSH_DONE_\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))__"
+
+        Task {
+            do {
+                let client = try await SSHClient.connect(
+                    host: self.host,
+                    port: .init(integerLiteral: self.port),
+                    authenticationMethod: .passwordBased(
+                        username: self.username,
+                        password: self.password
+                    ),
+                    hostKeyValidator: .acceptAnything(),
+                    reconnect: .never
+                )
+
+                self.client = client
+                self.isConnected = true
+
+                let ptyReq = SSHChannelRequestEvent.PseudoTerminalRequest(
+                    wantReply: true,
+                    term: "xterm-256color",
+                    terminalCharacterWidth: 100,
+                    terminalRowHeight: 40,
+                    terminalPixelWidth: 0,
+                    terminalPixelHeight: 0,
+                    terminalModes: .init([.ECHO: 0])
+                )
+
+                try await client.withPTY(ptyReq) { [weak self] stream, writer in
+                    guard let self = self else { return }
+
+                    self.activeWriter = writer
+
+                    for try await event in stream {
+                        let buffer: ByteBuffer
+
+                        switch event {
+                        case .stdout(let b):
+                            buffer = b
+                        case .stderr(let b):
+                            buffer = b
+                        }
+
+                        if let text = buffer.getString(
+                            at: buffer.readerIndex,
+                            length: buffer.readableBytes
+                        ) {
+                            self.receiveOutput(text)
+                        }
+                    }
+                }
+
+                if self.isConnected {
+                    self.finishConnection(message: nil)
+                }
+            } catch {
+                self.finishConnection(
+                    message: "连接断开或异常: \(error.localizedDescription)"
+                )
+            }
+        }
+    }
+
+    // MARK: - 输出接收/批处理
+    private func receiveOutput(_ rawText: String) {
+        let cleaned = cleanANSI(rawText)
+        guard !cleaned.isEmpty else { return }
+
+        pendingOutput.append(cleaned)
+
+        // 约 80ms 合并一次 UI 更新。
+        if flushTask == nil {
+            flushTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 80_000_000)
+
+                guard !Task.isCancelled else { return }
+
+                await MainActor.run {
+                    self?.flushOutput()
+                }
+            }
+        }
+
+        // 极端大输出时不要让待处理缓冲无限涨。
+        if pendingOutput.count >= 500_000 {
+            flushOutput()
+        }
+    }
+
+    private func flushOutput() {
+        flushTask?.cancel()
+        flushTask = nil
+
+        guard !pendingOutput.isEmpty else { return }
+
+        let text = pendingOutput
+        pendingOutput = ""
+
+        processOutput(text)
+    }
+
+    private func processOutput(_ text: String) {
+        // x-ui / k 退出时，最后返回的提示符必须单独恢复，
+        // 不能被当成交互程序的输出。
+        if let interactiveID = activeInteractiveID {
+            let split = splitTrailingShellPrompt(text)
+
+            if !split.body.isEmpty {
+                appendOutput(split.body, to: interactiveID)
+            }
+
+            if let prompt = split.prompt {
+                shellPrompt = prompt
+                activeInteractiveID = nil
+                interactivePromptBuffer = ""
+            } else {
+                interactivePromptBuffer.append(text)
+                if interactivePromptBuffer.count > 2000 {
+                    interactivePromptBuffer = String(interactivePromptBuffer.suffix(1000))
+                }
+            }
             return
         }
-        shortcuts = l
+
+        markerBuffer.append(text)
+
+        while let range = markerBuffer.range(of: commandEndMarker) {
+            let before = String(markerBuffer[..<range.lowerBound])
+            appendOutputToCurrentCommand(before)
+
+            if !pendingCommands.isEmpty {
+                pendingCommands.removeFirst()
+            }
+
+            // marker 后面的内容通常就是 shell 恢复出来的 prompt。
+            // 先保留，等完整 prompt 到齐后再解析。
+            markerBuffer = String(markerBuffer[range.upperBound...])
+        }
+
+        // 没有待完成命令时，只捕获真实 prompt。
+        // 这样首次登录、普通命令结束、x-ui 退出都能恢复命令符。
+        if pendingCommands.isEmpty {
+            let split = splitTrailingShellPrompt(markerBuffer)
+
+            if let prompt = split.prompt {
+                shellPrompt = prompt
+                markerBuffer = split.body
+            }
+
+            // 欢迎信息等不属于命令历史，避免重新出现在终端底部。
+            if shellPrompt.isEmpty && markerBuffer.count > 512 {
+                markerBuffer = String(markerBuffer.suffix(256))
+            }
+            return
+        }
+
+        let maxPrefix = min(commandEndMarker.count - 1, markerBuffer.count)
+        var splitIndex = markerBuffer.endIndex
+
+        if maxPrefix > 0 {
+            for length in stride(from: maxPrefix, through: 1, by: -1) {
+                let idx = markerBuffer.index(markerBuffer.endIndex, offsetBy: -length)
+                if markerBuffer[idx...].hasPrefix(String(commandEndMarker.prefix(length))) {
+                    splitIndex = idx
+                    break
+                }
+            }
+        }
+
+        if splitIndex != markerBuffer.endIndex {
+            appendOutputToCurrentCommand(String(markerBuffer[..<splitIndex]))
+            markerBuffer = String(markerBuffer[splitIndex...])
+        } else {
+            appendOutputToCurrentCommand(markerBuffer)
+            markerBuffer = ""
+        }
     }
-    func save() { if let d = try? JSONEncoder().encode(shortcuts) { UserDefaults.standard.set(d, forKey: key) } }
-    func add(_ s: Shortcut) { shortcuts.append(s); save() }
-    func delete(_ s: Shortcut) { shortcuts.removeAll { $0.id == s.id }; save() }
+
+    // 从 SSH 输出尾部提取真实 shell prompt。
+    private func splitTrailingShellPrompt(_ text: String) -> (body: String, prompt: String?) {
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+
+        var lines = normalized.components(separatedBy: "\n")
+
+        guard let index = lines.lastIndex(where: {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) else {
+            return (normalized, nil)
+        }
+
+        let candidate = lines[index].trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard candidate.range(
+            of: #"^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:.*[#$]$"#,
+            options: .regularExpression
+        ) != nil else {
+            return (normalized, nil)
+        }
+
+        lines.remove(at: index)
+
+        let body = lines
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .newlines)
+
+        return (body.isEmpty ? "" : body + "\n", candidate)
+    }
+
+
+    private func appendOutputToCurrentCommand(_ text: String) {
+        guard let pending = pendingCommands.first, !text.isEmpty else { return }
+        appendOutput(text, to: pending.id, echoCommand: pending.command)
+    }
+
+    private func appendOutput(_ text: String, to id: UUID, echoCommand: String? = nil) {
+        guard let index = history.firstIndex(where: { $0.id == id }), !truncatedIDs.contains(id) else { return }
+        var output = history[index].output + text
+        if let echoCommand {
+            if output.hasPrefix(echoCommand + "\n") { output.removeFirst(echoCommand.count + 1) }
+            else if output.hasPrefix(echoCommand) { output.removeFirst(echoCommand.count) }
+        }
+        if output.count >= maxOutputCharactersPerCommand {
+            output = String(output.prefix(maxOutputCharactersPerCommand)) + "\n[输出过长，已限制显示]"
+            truncatedIDs.insert(id)
+        }
+        history[index].output = output
+    }
+
+    private func shellPromptAppeared(in text: String) -> Bool {
+        let line = text.split(separator: "\n", omittingEmptySubsequences: true).last.map(String.init) ?? text
+        let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.range(of: #"^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:.*[#$] ?$"#, options: .regularExpression) != nil
+    }
+
+    private func appendHistory(_ item: CommandHistoryItem) {
+        history.append(item)
+        while history.count > maxHistoryItems {
+            let protected = Set(pendingCommands.map { $0.id }).union(activeInteractiveID.map { [$0] } ?? [])
+            guard let index = history.firstIndex(where: { !protected.contains($0.id) }) else { break }
+            let removed = history.remove(at: index)
+            truncatedIDs.remove(removed.id)
+        }
+    }
+
+    // MARK: - 发送命令
+    func sendCommand(_ command: String) {
+        guard isConnected else { return }
+        let cmd = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cmd.isEmpty else { return }
+
+        let promptForCommand = shellPrompt.isEmpty
+            ? "\(username)@\(host):~#"
+            : shellPrompt
+
+        shellPrompt = ""
+
+        let item = CommandHistoryItem(
+            command: cmd,
+            output: "",
+            prompt: promptForCommand
+        )
+        appendHistory(item)
+        pendingCommands.append(PendingCommand(id: item.id, command: cmd))
+
+        enqueueWrite("\(cmd)\nprintf '\\n\(commandEndMarker)\\n'\n") { [weak self] error in
+            guard let self else { return }
+            if let error { self.handleWriteFailure(id: item.id, error: error) }
+        }
+    }
+
+
+    func sendInteractiveCommand(_ command: String) {
+        guard isConnected else { return }
+        let cmd = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cmd.isEmpty else { return }
+        guard activeInteractiveID == nil else { return }
+
+        let promptForCommand = shellPrompt.isEmpty
+            ? "\(username)@\(host):~#"
+            : shellPrompt
+
+        shellPrompt = ""
+
+        let item = CommandHistoryItem(
+            command: cmd,
+            output: "",
+            prompt: promptForCommand
+        )
+        appendHistory(item)
+        activeInteractiveID = item.id
+        interactivePromptBuffer = ""
+
+        enqueueWrite("\(cmd)\n") { [weak self] error in
+            guard let self else { return }
+            if let error {
+                self.handleWriteFailure(id: item.id, error: error)
+                if self.activeInteractiveID == item.id {
+                    self.activeInteractiveID = nil
+                    self.interactivePromptBuffer = ""
+                    self.shellPrompt = promptForCommand
+                }
+            }
+        }
+    }
+
+
+    private func handleWriteFailure(id: UUID, error: Error) {
+        if let index = history.firstIndex(where: { $0.id == id }) {
+            history[index].output = "写入失败：\(error.localizedDescription)"
+        }
+        pendingCommands.removeAll { $0.id == id }
+        if activeInteractiveID == id {
+            activeInteractiveID = nil
+            interactivePromptBuffer = ""
+        }
+    }
+
+    // MARK: - 控制键
+    // 控制键直接进入同一个串行写入队列，不创建命令历史。
+    func sendControl(_ value: String) {
+        guard isConnected else { return }
+        enqueueWrite(value)
+    }
+
+    func sendCtrlC() { sendControl("\u{03}") }
+    func sendEscape() { sendControl("\u{1B}") }
+    func sendSpace() { sendControl(" ") }
+    func sendBackspace() { sendControl("\u{7F}") }
+
+    // MARK: - 串行写入
+    private func enqueueWrite(
+        _ value: String,
+        completion: ((Error?) -> Void)? = nil
+    ) {
+        guard let writer = activeWriter else {
+            completion?(NSError(
+                domain: "MySSH",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "SSH 写入通道不存在"]
+            ))
+            return
+        }
+
+        let previous = writeChain
+        let task = Task { [weak self] in
+            if let previous { await previous.value }
+            guard let self else { return }
+
+            do {
+                var buffer = ByteBufferAllocator().buffer(capacity: value.utf8.count)
+                buffer.writeString(value)
+                try await writer.write(buffer)
+                completion?(nil)
+            } catch {
+                completion?(error)
+            }
+        }
+        writeChain = task
+    }
+
+    // MARK: - App 生命周期
+    func appDidEnterBackground() {
+        guard isConnected else { return }
+
+        backgroundTask = UIApplication.shared.beginBackgroundTask(
+            withName: "SSHKeepAlive"
+        ) { [weak self] in
+            self?.endBackgroundTask()
+        }
+    }
+
+    func appWillEnterForeground() {
+        endBackgroundTask()
+    }
+
+    private func endBackgroundTask() {
+        if backgroundTask != .invalid {
+            UIApplication.shared.endBackgroundTask(backgroundTask)
+            backgroundTask = .invalid
+        }
+    }
+
+    // MARK: - 连接结束
+    private func finishConnection(message: String?) {
+        flushOutput()
+
+        isConnected = false
+        activeWriter = nil
+        pendingCommands.removeAll()
+        activeInteractiveID = nil
+        interactivePromptBuffer = ""
+        markerBuffer = ""
+
+        if let message, !message.isEmpty {
+            appendHistory(
+                CommandHistoryItem(command: "system", output: message)
+            )
+        }
+    }
+
+    func disconnect() {
+        flushOutput()
+        endBackgroundTask()
+
+        let clientToClose = client
+        client = nil
+        activeWriter = nil
+        isConnected = false
+        writeChain?.cancel()
+        writeChain = nil
+        pendingCommands.removeAll()
+        activeInteractiveID = nil
+        interactivePromptBuffer = ""
+        markerBuffer = ""
+        pendingOutput = ""
+        shellPrompt = ""
+
+        Task {
+            try? await clientToClose?.close()
+        }
+    }
 }
 
-// MARK: - 会话
-struct Session: Identifiable, Codable {
+
+// MARK: - TerminalView
+
+import SwiftUI
+import UIKit
+
+struct QuickCmd: Identifiable, Codable, Equatable {
     var id = UUID()
     var name: String
-    var host: String
-    var port: Int = 22
-    var username: String
-    var shortName: String { name.isEmpty ? host : name }
-    var displayHost: String { "\(username)@\(host):\(port)" }
+    var cmd: String
 }
 
-class SessionStore: ObservableObject {
-    @Published var sessions: [Session] = []
-    private let key = "sshblack.sessions.v1"
-    init() { load() }
-    func load() { if let d = UserDefaults.standard.data(forKey: key), let l = try? JSONDecoder().decode([Session].self, from: d) { sessions = l } }
-    func save() { if let d = try? JSONEncoder().encode(sessions) { UserDefaults.standard.set(d, forKey: key) } }
-    func upsert(_ s: Session) { if let i = sessions.firstIndex(where: {$0.id == s.id}) { sessions[i]=s } else { sessions.append(s) }; save() }
-    func delete(_ s: Session) { sessions.removeAll { $0.id == s.id }; KeychainHelper.delete(account: "session.\(s.id.uuidString).password"); save() }
-    func password(for s: Session) -> String { KeychainHelper.read(account: "session.\(s.id.uuidString).password") ?? "" }
-    func setPassword(_ p: String, for s: Session) { KeychainHelper.save(p, account: "session.\(s.id.uuidString).password") }
-}
-
-// MARK: - Keychain
-enum KeychainHelper {
-    private static let service = "com.example.sshblack"
-    static func save(_ v: String, account: String) {
-        guard !v.isEmpty else { delete(account: account); return }
-        let q: [String:Any] = [kSecClass as String:kSecClassGenericPassword,kSecAttrService as String:service,kSecAttrAccount as String:account]
-        SecItemDelete(q as CFDictionary)
-        var a = q
-        a[kSecValueData as String] = Data(v.utf8)
-        a[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        SecItemAdd(a as CFDictionary, nil)
-    }
-    static func read(account: String) -> String? {
-        let q: [String:Any] = [kSecClass as String:kSecClassGenericPassword,kSecAttrService as String:service,kSecAttrAccount as String:account,kSecReturnData as String:true,kSecMatchLimit as String:kSecMatchLimitOne]
-        var i: AnyObject?
-        guard SecItemCopyMatching(q as CFDictionary, &i) == errSecSuccess, let d = i as? Data else { return nil }
-        return String(data: d, encoding: .utf8)
-    }
-    static func delete(account: String) {
-        let q: [String:Any] = [kSecClass as String:kSecClassGenericPassword,kSecAttrService as String:service,kSecAttrAccount as String:account]
-        SecItemDelete(q as CFDictionary)
-    }
-}
-
-// MARK: - SSH 认证
-enum SSHClientError: Error, LocalizedError {
-    case notConnected
-    case hostKeyChanged(String)
-    var errorDescription: String? {
-        switch self {
-        case .notConnected: return "未连接"
-        case .hostKeyChanged(let f): return "⚠️ 主机密钥变更：\(f)"
-        }
-    }
-}
-
-final class PasswordAuth: NIOSSHClientUserAuthenticationDelegate {
-    let u: String
-    let p: String
-    init(u: String, p: String) { self.u = u; self.p = p }
-    func nextAuthenticationType(availableMethods: NIOSSHAvailableUserAuthenticationMethods, nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>) {
-        nextChallengePromise.succeed(NIOSSHUserAuthenticationOffer(username: u, serviceName: "ssh-connection", offer: .password(.init(password: p))))
-    }
-}
-
-final class TOFUHostKeyDelegate: NIOSSHClientServerAuthenticationDelegate {
+struct TerminalView: View {
+    let serverName: String
     let host: String
     let port: Int
-    init(host: String, port: Int) { self.host = host; self.port = port }
-    func validateHostKey(hostKey: NIOSSHPublicKey, validationCompletePromise: EventLoopPromise<Void>) {
-        let desc = String(describing: hostKey)
-        let fp = SHA256.hash(data: Data(desc.utf8)).compactMap { String(format: "%02x", $0) }.joined()
-        let acct = "hostkey.\(host):\(port)"
-        if let saved = KeychainHelper.read(account: acct) {
-            if saved == fp { validationCompletePromise.succeed(()) }
-            else { validationCompletePromise.fail(SSHClientError.hostKeyChanged(fp)) }
-        } else {
-            KeychainHelper.save(fp, account: acct)
-            validationCompletePromise.succeed(())
-        }
-    }
-}
+    let username: String
+    let password: String
 
-final class DataHandler: ChannelInboundHandler {
-    typealias InboundIn = SSHChannelData
-    let onData: (Data) -> Void
-    let onClose: () -> Void
-    init(onData: @escaping (Data) -> Void, onClose: @escaping () -> Void) { self.onData = onData; self.onClose = onClose }
-    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        let d = unwrapInboundIn(data)
-        if case .byteBuffer(var b) = d.data, let bytes = b.readBytes(length: b.readableBytes) { onData(Data(bytes)) }
-    }
-    func channelInactive(context: ChannelHandlerContext) { onClose(); context.fireChannelInactive() }
-    func errorCaught(context: ChannelHandlerContext, error: Error) { onClose(); context.close(promise: nil) }
-}
+    @StateObject private var session = SSHSession()
+    @State private var inputCommand: String = ""
+    @FocusState private var isSystemKeyboardFocused: Bool
 
-// MARK: - SSH 服务
-@MainActor
-class SSHService: ObservableObject, Identifiable {
-    let id = UUID()
-    @Published var isConnected = false
-    @Published var statusText = "未连接"
-    @Published var commandHistory: [CommandRecord] = []
+    @State private var showMiniKeyboard: Bool = false
+    @Environment(\.scenePhase) private var scenePhase
 
-    private var group: MultiThreadedEventLoopGroup?
-    private var parent: Channel?
-    private var child: Channel?
-    var onData: ((Data) -> Void)?
-    var onClose: (() -> Void)?
+    @State private var quickCommands: [QuickCmd] = []
+    @State private var showingAddSheet = false
+    @State private var newCmdName = ""
+    @State private var newCmdContent = ""
+    @State private var copiedTip: String? = nil
 
-    private var initialBuffer = ""
-    private var isFiltering = false
-    private var timeoutWork: DispatchWorkItem?
-    private var pendingInput = ""
-    private var isCapturingOutput = false
-    private var captureStart: Date?
+    private let storageKey = "SavedQuickCommands"
 
-    func connect(session: Session, password: String) async {
-        await disconnect()
-        statusText = "正在连接…"
-        isFiltering = true
-        initialBuffer = ""
-        commandHistory.removeAll()
-        pendingInput = ""
-        isCapturingOutput = false
-        do {
-            let g = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-            let keyDel = TOFUHostKeyDelegate(host: session.host, port: session.port)
-            let bs = ClientBootstrap(group: g).channelInitializer { ch in
-                ch.pipeline.addHandler(NIOSSHHandler(
-                    role: .client(.init(userAuthDelegate: PasswordAuth(u: session.username, p: password), serverAuthDelegate: keyDel)),
-                    allocator: ch.allocator, inboundChildChannelInitializer: nil))
-            }
-            let ch = try await bs.connect(host: session.host, port: session.port).get()
-            self.group = g
-            self.parent = ch
-            try await openShell(cols: 80, rows: 24)
-            self.isConnected = true
-            self.statusText = "已连接 · \(session.username)@\(session.host)"
-
-            let work = DispatchWorkItem { [weak self] in
-                Task { @MainActor in
-                    guard let self = self, self.isFiltering else { return }
-                    self.isFiltering = false
-                    if !self.initialBuffer.isEmpty {
-                        let c = TerminalColorizer.colorize(self.initialBuffer)
-                        if let d = c.data(using: .utf8) { self.onData?(d) }
-                        self.initialBuffer = ""
-                    }
-                }
-            }
-            self.timeoutWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
-        } catch {
-            self.isConnected = false
-            self.statusText = "连接失败：\(error.localizedDescription)"
-            isFiltering = false
-            await disconnect()
-        }
-    }
-
-    private func openShell(cols: Int, rows: Int) async throws {
-        guard let p = parent else { throw SSHClientError.notConnected }
-        let h = try await p.pipeline.handler(type: NIOSSHHandler.self).get()
-        let cp = p.eventLoop.makePromise(of: Channel.self)
-        h.createChannel(cp, channelType: .session) { [weak self] child, _ in
-            guard let self = self else { return child.eventLoop.makeFailedFuture(SSHClientError.notConnected) }
-            return child.pipeline.addHandler(DataHandler(
-                onData: { [weak self] d in
-                    Task { @MainActor in
-                        guard let self = self else { return }
-                        if self.isFiltering {
-                            if let s = String(data: d, encoding: .utf8) {
-                                self.initialBuffer += s
-                                if let r = self.initialBuffer.range(of: "Last login:") {
-                                    self.isFiltering = false
-                                    self.timeoutWork?.cancel()
-                                    let keep = String(self.initialBuffer[r.lowerBound...])
-                                    let c = TerminalColorizer.colorize(keep)
-                                    if let kd = c.data(using: .utf8) { self.onData?(kd) }
-                                    self.initialBuffer = ""
-                                } else if self.initialBuffer.count > 2048 {
-                                    self.isFiltering = false
-                                    self.timeoutWork?.cancel()
-                                    let c = TerminalColorizer.colorize(self.initialBuffer)
-                                    if let kd = c.data(using: .utf8) { self.onData?(kd) }
-                                    self.initialBuffer = ""
-                                }
-                            } else {
-                                self.isFiltering = false
-                                self.onData?(d)
-                            }
-                        } else {
-                            if let s = String(data: d, encoding: .utf8) {
-                                if self.isCapturingOutput, !self.commandHistory.isEmpty {
-                                    let idx = self.commandHistory.count - 1
-                                    let clean = TerminalColorizer.normalizeCR(TerminalColorizer.stripANSI(s))
-                                    let lines = clean.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-                                    var toAppend: [String] = []
-                                    for line in lines {
-                                        let trimmed = line.trimmingCharacters(in: .whitespaces)
-                                        if TerminalColorizer.isPromptLine(trimmed) {
-                                            self.isCapturingOutput = false
-                                            break
-                                        }
-                                        if trimmed == self.commandHistory[idx].command { continue }
-                                        toAppend.append(line)
-                                    }
-                                    if !toAppend.isEmpty {
-                                        self.commandHistory[idx].output += toAppend.joined(separator: "\n")
-                                    }
-                                    if let start = self.captureStart, Date().timeIntervalSince(start) > 15 {
-                                        self.isCapturingOutput = false
-                                    }
-                                }
-                                let c = TerminalColorizer.colorize(s)
-                                self.onData?(Data(c.utf8))
-                            } else {
-                                self.onData?(d)
-                            }
-                        }
-                    }
-                },
-                onClose: { [weak self] in Task { @MainActor in self?.isConnected = false; self?.statusText = "连接已断开"; self?.onClose?() } }
-            ))
-        }
-        let c = try await cp.futureResult.get()
-        self.child = c
-        let pty = SSHChannelRequestEvent.PseudoTerminalRequest(wantReply: true, term: "xterm-256color", terminalCharacterWidth: max(cols,20), terminalRowHeight: max(rows,5), terminalPixelWidth: 0, terminalPixelHeight: 0, terminalModes: SSHTerminalModes([:]))
-        let pp = c.eventLoop.makePromise(of: Void.self)
-        c.triggerUserOutboundEvent(pty, promise: pp)
-        try await pp.futureResult.get()
-        let sh = SSHChannelRequestEvent.ShellRequest(wantReply: true)
-        let sp = c.eventLoop.makePromise(of: Void.self)
-        c.triggerUserOutboundEvent(sh, promise: sp)
-        try await sp.futureResult.get()
-    }
-
-    func send(_ data: Data) {
-        guard let c = child else { return }
-        let bytes = [UInt8](data)
-        c.eventLoop.execute {
-            var b = c.allocator.buffer(capacity: bytes.count)
-            b.writeBytes(bytes)
-            c.writeAndFlush(NIOAny(SSHChannelData(type: .channel, data: .byteBuffer(b))), promise: nil)
-        }
-    }
-
-    func appendInput(_ s: String) {
-        pendingInput += s
-        send(Data(s.utf8))
-    }
-
-    func backspace() {
-        if !pendingInput.isEmpty { pendingInput.removeLast() }
-        send(Data([0x7F]))
-    }
-
-    func cancelInput() {
-        pendingInput = ""
-        isCapturingOutput = false
-        send(Data([0x03]))
-    }
-
-    func commitInput() {
-        let cmd = pendingInput.trimmingCharacters(in: .whitespaces)
-        if !cmd.isEmpty {
-            commandHistory.append(CommandRecord(command: cmd))
-            isCapturingOutput = true
-            captureStart = Date()
-        }
-        pendingInput = ""
-        send(Data([0x0D]))
-    }
-
-    func sendCommand(_ command: String) {
-        commandHistory.append(CommandRecord(command: command))
-        isCapturingOutput = true
-        captureStart = Date()
-        send(Data((command + "\n").utf8))
-    }
-
-    func sendRawKey(_ code: UInt8) { send(Data([code])) }
-
-    func resize(cols: Int, rows: Int) {
-        guard let c = child else { return }
-        let r = SSHChannelRequestEvent.WindowChangeRequest(terminalCharacterWidth: max(cols,20), terminalRowHeight: max(rows,5), terminalPixelWidth: 0, terminalPixelHeight: 0)
-        c.triggerUserOutboundEvent(r, promise: nil)
-    }
-
-    func disconnect() async {
-        timeoutWork?.cancel()
-        timeoutWork = nil
-        if let c = child { try? await c.close().get() }
-        if let p = parent { try? await p.close().get() }
-        if let g = group { try? await g.shutdownGracefully() }
-        child = nil
-        parent = nil
-        group = nil
-        isConnected = false
-        statusText = "未连接"
-        pendingInput = ""
-        isCapturingOutput = false
-    }
-}
-
-@MainActor
-class SSHManager: ObservableObject {
-    static let shared = SSHManager()
-    @Published var services: [UUID: SSHService] = [:]
-    func service(for s: Session) -> SSHService {
-        if let x = services[s.id] { return x }
-        let x = SSHService()
-        services[s.id] = x
-        return x
-    }
-}
-
-// MARK: - 终端桥接
-final class TerminalBridge: NSObject, TerminalViewDelegate {
-    weak var terminalView: TerminalView?
-    var onInput: ((Data) -> Void)?
-    var onResize: ((Int, Int) -> Void)?
-    func send(source: TerminalView, data: ArraySlice<UInt8>) { onInput?(Data(data)) }
-    func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) { onResize?(newCols, newRows) }
-    func setTerminalTitle(source: TerminalView, title: String) {}
-    func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
-    func scrolled(source: TerminalView, position: Double) {}
-    func bell(source: TerminalView) {}
-    func clipboardCopy(source: TerminalView, content: Data) {
-        if let s = String(data: content, encoding: .utf8) {
-            UIPasteboard.general.string = s
-        }
-    }
-    func iTermContent(source: TerminalView, content: ArraySlice<UInt8>) {}
-    func rangeChanged(source: TerminalView, startY: Int, endY: Int) {}
-    func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {}
-}
-
-// MARK: - 键盘三态
-enum KeyboardMode { case custom, system, hidden }
-
-class CustomTerminalView: TerminalView {
-    var allowSystemKeyboard: Bool = false {
-        didSet {
-            guard oldValue != allowSystemKeyboard else { return }
-            if allowSystemKeyboard {
-                self.inputView = nil
-                self.inputAccessoryView = nil
-                self.reloadInputViews()
-            } else {
-                self.inputView = UIView()
-                self.inputAccessoryView = nil
-                self.reloadInputViews()
-                if self.isFirstResponder { self.resignFirstResponder() }
-            }
-        }
-    }
-}
-
-struct TerminalWrapper: UIViewRepresentable {
-    @ObservedObject var ssh: SSHService
-    let bridge: TerminalBridge
-    @Binding var keyboardMode: KeyboardMode
-
-    func makeUIView(context: Context) -> CustomTerminalView {
-        let v = CustomTerminalView(frame: .zero)
-        v.terminalDelegate = bridge
-        bridge.terminalView = v
-        v.backgroundColor = UIColor(Theme.bg)
-        v.nativeBackgroundColor = UIColor(Theme.bg)
-        v.nativeForegroundColor = UIColor(Theme.text)
-        v.font = FontLoader.monoFont(size: 15)
-        v.allowSystemKeyboard = false
-        v.inputView = UIView()
-        v.inputAccessoryView = nil
-        ssh.onData = { [weak v] d in
-            guard let v = v else { return }
-            DispatchQueue.main.async { v.feed(byteArray: [UInt8](d)[...]) }
-        }
-        bridge.onInput = { [weak ssh] d in ssh?.send(d) }
-        bridge.onResize = { [weak ssh] c, r in ssh?.resize(cols: c, rows: r) }
-        DispatchQueue.main.async {
-            let d = v.getTerminal().getDims()
-            ssh.resize(cols: d.cols, rows: d.rows)
-        }
-        return v
-    }
-
-    func updateUIView(_ v: CustomTerminalView, context: Context) {
-        let want = (keyboardMode == .system)
-        if v.allowSystemKeyboard != want {
-            v.allowSystemKeyboard = want
-            if want {
-                DispatchQueue.main.async { if !v.isFirstResponder { _ = v.becomeFirstResponder() } }
-            }
-        }
-    }
-}
-
-// MARK: - 主界面
-struct RootView: View {
-    var body: some View { NavigationStack { SessionListView() }.tint(Theme.blue) }
-}
-
-struct SessionListView: View {
-    @EnvironmentObject var store: SessionStore
-    @EnvironmentObject var shortcutStore: ShortcutStore
-    @State var editing: Session?
-    @State var isNew = false
-    @State var showShortcuts = false
-    var body: some View {
-        ZStack {
-            Theme.bg.ignoresSafeArea()
-            VStack(spacing: 0) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("SSH 黑").font(.system(size: 34, weight: .heavy, design: .rounded)).foregroundColor(Theme.blue)
-                        Text("\(store.sessions.count) 个会话").font(.caption).foregroundColor(Theme.textDim)
-                    }
-                    Spacer()
-                    Button { showShortcuts = true } label: {
-                        Image(systemName: "slider.horizontal.3")
-                            .font(.system(size: 18, weight: .bold))
-                            .foregroundColor(Theme.blue)
-                            .frame(width: 40, height: 40)
-                            .background(Circle().fill(Theme.blueSoft))
-                    }
-                    Button { isNew = true; editing = Session(name: "", host: "", username: "") } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 18, weight: .bold))
-                            .foregroundColor(.black)
-                            .frame(width: 40, height: 40)
-                            .background(Circle().fill(Theme.blue))
-                    }
-                }.padding()
-                if store.sessions.isEmpty {
-                    Spacer()
-                    Text("还没有会话").foregroundColor(Theme.textDim)
-                    Spacer()
-                } else {
-                    ScrollView {
-                        LazyVStack(spacing: 10) {
-                            ForEach(store.sessions) { s in
-                                NavigationLink { TerminalScreen(session: s) } label: {
-                                    HStack {
-                                        Text(s.shortName).font(.headline).foregroundColor(Theme.text)
-                                        Spacer()
-                                        Text(s.displayHost).font(.caption).foregroundColor(Theme.textDim)
-                                    }
-                                    .padding()
-                                    .background(RoundedRectangle(cornerRadius: 12).fill(Theme.bgElev))
-                                }
-                                .contextMenu {
-                                    Button { isNew = false; editing = s } label: { Label("编辑", systemImage: "square.and.pencil") }
-                                    Button(role: .destructive) { store.delete(s) } label: { Label("删除", systemImage: "trash") }
-                                }
-                            }
-                        }.padding()
-                    }
-                }
-            }
-        }
-        .sheet(item: $editing) { s in SessionEditView(session: s, isNew: isNew).environmentObject(store) }
-        .sheet(isPresented: $showShortcuts) { ShortcutEditView().environmentObject(shortcutStore) }
-    }
-}
-
-struct ShortcutEditView: View {
-    @EnvironmentObject var store: ShortcutStore
-    @Environment(\.dismiss) var dismiss
-    @State var newName = ""
-    @State var newCmd = ""
-    var body: some View {
-        NavigationStack {
-            List {
-                Section("添加快捷指令") {
-                    TextField("名称", text: $newName)
-                    TextField("命令", text: $newCmd)
-                    Button("添加") {
-                        guard !newName.isEmpty, !newCmd.isEmpty else { return }
-                        store.add(Shortcut(name: newName, command: newCmd))
-                        newName = ""
-                        newCmd = ""
-                    }
-                }
-                Section("已保存") {
-                    ForEach(store.shortcuts) { s in
-                        HStack {
-                            VStack(alignment: .leading) {
-                                Text(s.name).font(.headline)
-                                Text(s.command).font(.caption).foregroundColor(.gray)
-                            }
-                            Spacer()
-                            Button(role: .destructive) { store.delete(s) } label: { Image(systemName: "trash") }
-                        }
-                    }
-                }
-            }
-            .navigationTitle("快捷指令管理")
-            .toolbar { Button("关闭") { dismiss() } }
-        }
-    }
-}
-
-struct SessionEditView: View {
-    @EnvironmentObject var store: SessionStore
-    @Environment(\.dismiss) var dismiss
-    @State var session: Session
-    let isNew: Bool
-    @State var password = ""
-    var body: some View {
-        NavigationStack {
-            Form {
-                TextField("名称", text: $session.name)
-                TextField("主机", text: $session.host)
-                TextField("端口", value: $session.port, format: .number)
-                TextField("用户名", text: $session.username)
-                SecureField("密码", text: $password)
-                Button("保存") {
-                    if session.name.isEmpty { session.name = session.host }
-                    store.upsert(session)
-                    store.setPassword(password, for: session)
-                    dismiss()
-                }
-            }
-            .navigationTitle(isNew ? "新建" : "编辑")
-            .toolbar { Button("取消") { dismiss() } }
-        }
-        .onAppear { password = store.password(for: session) }
-    }
-}
-
-// MARK: - 终端页面
-struct TerminalScreen: View {
-    let session: Session
-    @EnvironmentObject var shortcutStore: ShortcutStore
-    @Environment(\.dismiss) var dismiss
-    @StateObject private var ssh: SSHService
-    @State private var bridge = TerminalBridge()
-    @State private var showLog = false
-    @State private var showShortcuts = false
-    @State private var keyboardMode: KeyboardMode = .custom
-
-    init(session: Session) {
-        self.session = session
-        _ssh = StateObject(wrappedValue: SSHManager.shared.service(for: session))
-    }
+    // 单个历史块最多渲染 400 行，避免超长输出拖慢 SwiftUI。
+    private let maxRenderedLinesPerBlock = 400
 
     var body: some View {
         ZStack {
-            Theme.bg.ignoresSafeArea()
             VStack(spacing: 0) {
-                HStack {
-                    Button { dismiss() } label: {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 16, weight: .bold))
-                            .foregroundColor(Theme.blue)
-                            .padding(8)
-                            .background(Circle().fill(Theme.blueSoft))
-                    }
-                    Circle().fill(ssh.isConnected ? Color.green : Theme.red).frame(width: 8, height: 8)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(session.shortName).font(.system(.subheadline, design: .rounded).weight(.semibold)).foregroundColor(Theme.text).lineLimit(1)
-                        Text(ssh.statusText).font(.caption2.monospaced()).foregroundColor(Theme.textDim).lineLimit(1)
-                    }
-                    Spacer()
-                    Button {
-                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-                        keyboardMode = .hidden
-                    } label: {
-                        Image(systemName: "keyboard.chevron.compact.down")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundColor(Theme.blue)
-                            .padding(8)
-                            .background(Circle().fill(Theme.blueSoft))
-                    }
-                    Button { showLog = true } label: {
-                        Image(systemName: "doc.text.magnifyingglass")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundColor(Theme.blue)
-                            .padding(8)
-                            .background(Circle().fill(Theme.blueSoft))
-                    }
-                }
-                .padding(.horizontal, 12).padding(.vertical, 10)
-                .background(Color.black.opacity(0.8))
-
+                // MARK: - 快捷命令栏
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
-                        Button { showShortcuts = true } label: {
-                            Text("+ 添加")
-                                .font(.system(.caption, design: .rounded).weight(.medium))
-                                .foregroundColor(Theme.blue)
-                                .padding(.horizontal, 12).padding(.vertical, 8)
-                                .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blueSoft))
+                        Button(action: { showingAddSheet = true }) {
+                            HStack(spacing: 3) {
+                                Image(systemName: "plus")
+                                Text("添加")
+                            }
+                            .font(.system(size: 11, weight: .bold))
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(Color.blue.opacity(0.3))
+                            .foregroundColor(.blue)
+                            .cornerRadius(6)
                         }
-                        ForEach(shortcutStore.shortcuts) { s in
-                            Button { ssh.sendCommand(s.command) } label: {
-                                Text(s.name)
-                                    .font(.system(.caption, design: .rounded).weight(.medium))
-                                    .foregroundColor(Theme.blue)
-                                    .padding(.horizontal, 12).padding(.vertical, 8)
-                                    .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blueSoft))
+
+                        Button(action: { copyAllQuickCommands() }) {
+                            HStack(spacing: 3) {
+                                Image(systemName: "doc.on.doc")
+                                Text("全复制")
+                            }
+                            .font(.system(size: 11, weight: .bold))
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
+                            .background(Color(white: 0.18))
+                            .foregroundColor(.white)
+                            .cornerRadius(6)
+                        }
+                        .disabled(quickCommands.isEmpty)
+
+                        ForEach(quickCommands) { item in
+                            Button(action: { runCommand(item.cmd, interactive: isInteractiveCommand(item.cmd, name: item.name)) }) {
+                                Text(item.name)
+                                    .font(.system(size: 11, weight: .medium))
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 5)
+                                    .background(Color(white: 0.18))
+                                    .foregroundColor(.white)
+                                    .cornerRadius(6)
+                            }
+                            .contextMenu {
+                                Button {
+                                    copyBlock(item.cmd, tip: "已复制此命令")
+                                } label: {
+                                    Label("复制此命令", systemImage: "doc.on.doc")
+                                }
+
+                                Button {
+                                    runCommand(item.cmd, interactive: isInteractiveCommand(item.cmd, name: item.name))
+                                } label: {
+                                    Label("执行此命令", systemImage: "play.fill")
+                                }
+
+                                Button(role: .destructive) {
+                                    deleteQuickCmd(item)
+                                } label: {
+                                    Label("删除快捷键", systemImage: "trash")
+                                }
                             }
                         }
                     }
-                    .padding(.horizontal, 8).padding(.vertical, 6)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
                 }
-                .background(Color.black.opacity(0.5))
-                .sheet(isPresented: $showShortcuts) { ShortcutEditView().environmentObject(shortcutStore) }
+                .background(Color(white: 0.12))
 
-                ZStack {
-                    TerminalWrapper(ssh: ssh, bridge: bridge, keyboardMode: $keyboardMode).background(Theme.bg)
-                    if keyboardMode == .hidden {
-                        Color.clear.contentShape(Rectangle()).onTapGesture { keyboardMode = .custom }
-                    }
-                }
-
-                if keyboardMode == .custom {
-                    CustomKeyPanel(
-                        onInput: { ssh.appendInput($0) },
-                        onBackspace: { ssh.backspace() },
-                        onCtrlC: { ssh.cancelInput() },
-                        onEnter: { ssh.commitInput() },
-                        onPaste: { if let s = UIPasteboard.general.string { ssh.appendInput(s) } },
-                        onShortcut: { ssh.sendCommand($0) },
-                        onEsc: { ssh.sendRawKey(0x1B) },
-                        onHide: {
-                            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-                            keyboardMode = .hidden
-                        },
-                        onSwitchToSystem: { keyboardMode = .system }
-                    )
-                } else {
-                    HStack {
-                        Button {
-                            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-                            keyboardMode = .custom
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: "keyboard")
-                                Text("微缩键盘")
-                            }
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundColor(Theme.blue)
-                            .padding(.horizontal, 12).padding(.vertical, 8)
-                            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blueSoft))
-                        }
-                        Button {
-                            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-                            keyboardMode = .hidden
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: "keyboard.chevron.compact.down")
-                                Text("收起")
-                            }
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundColor(Theme.orange)
-                            .padding(.horizontal, 12).padding(.vertical, 8)
-                            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.orange.opacity(0.2)))
-                        }
-                        Spacer()
-                        Text("已在线").font(.caption).foregroundColor(Theme.textDim)
-                        Spacer()
-                        Button { ssh.commitInput() } label: {
-                            Text("回车")
-                                .font(.system(size: 14, weight: .bold))
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 20).padding(.vertical, 8)
-                                .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blue))
-                        }
-                    }
-                    .padding(.horizontal, 8).padding(.vertical, 6)
-                    .background(Color.black.opacity(0.8))
-                }
-            }
-        }
-        .navigationBarBackButtonHidden(true)
-        .toolbar(.hidden, for: .navigationBar)
-        .sheet(isPresented: $showLog) {
-            CommandHistorySheet(records: ssh.commandHistory)
-        }
-        .task {
-            let pw = KeychainHelper.read(account: "session.\(session.id.uuidString).password") ?? ""
-            if !ssh.isConnected { await ssh.connect(session: session, password: pw) }
-        }
-    }
-}
-
-// MARK: - 命令历史
-struct CommandHistorySheet: View {
-    let records: [CommandRecord]
-    @Environment(\.dismiss) private var dismiss
-    var body: some View {
-        NavigationStack {
-            ZStack {
-                Theme.bg.ignoresSafeArea()
-                if records.isEmpty {
-                    Text("还没有执行过命令").foregroundColor(Theme.textDim)
-                } else {
+                // MARK: - 终端主体
+                ScrollViewReader { proxy in
                     ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 12) {
-                            ForEach(records.reversed()) { rec in
-                                let cleaned = TerminalColorizer.cleanOutput(rec.output)
-                                VStack(alignment: .leading, spacing: 8) {
-                                    HStack {
-                                        Text("$ \(rec.command)")
-                                            .font(.system(.caption, design: .monospaced))
-                                            .foregroundColor(Theme.blue)
-                                            .lineLimit(1)
-                                        Spacer()
-                                        Button {
-                                            UIPasteboard.general.string = cleaned
-                                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                        } label: {
-                                            HStack(spacing: 4) {
+                        LazyVStack(alignment: .leading, spacing: 14) {
+                            ForEach(session.history) { item in
+                                VStack(alignment: .leading, spacing: 4) {
+                                    if item.command == "system" {
+                                        HStack {
+                                            Text("[系统状态]")
+                                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                                .foregroundColor(.yellow.opacity(0.8))
+
+                                            Spacer()
+
+                                            Button(action: {
+                                                copyBlock(item.output, tip: "已复制系统信息")
+                                            }) {
                                                 Image(systemName: "doc.on.doc")
-                                                Text("复制这段")
+                                                    .font(.system(size: 11))
+                                                    .foregroundColor(.gray)
                                             }
-                                            .font(.caption)
-                                            .foregroundColor(Theme.blue)
-                                            .padding(.horizontal, 10).padding(.vertical, 5)
-                                            .background(RoundedRectangle(cornerRadius: 6).fill(Theme.blueSoft))
+                                        }
+
+                                        renderOutputLines(item.output, defaultColor: .yellow)
+                                    } else {
+                                        HStack(alignment: .center) {
+                                            Text("\(item.prompt.isEmpty ? "\(username)@\(host):~#" : item.prompt) \(item.command)")
+                                                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                                .foregroundColor(.cyan)
+                                                .textSelection(.enabled)
+
+                                            Spacer()
+
+                                            Button(action: {
+                                                let fullBlock = commandBlock(for: item)
+                                                copyBlock(fullBlock, tip: "已复制整段命令与输出")
+                                            }) {
+                                                HStack(spacing: 3) {
+                                                    Image(systemName: "doc.on.doc")
+                                                    Text("复制整段")
+                                                }
+                                                .font(.system(size: 10, weight: .medium))
+                                                .foregroundColor(.gray)
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 3)
+                                                .background(Color(white: 0.18))
+                                                .cornerRadius(4)
+                                            }
+                                        }
+
+                                        renderOutputLines(item.output, defaultColor: .green)
+
+                                        if !item.output.isEmpty {
+                                            HStack {
+                                                Spacer()
+
+                                                Button(action: {
+                                                    let fullBlock = commandBlock(for: item)
+                                                    copyBlock(fullBlock, tip: "已复制整段命令与输出")
+                                                }) {
+                                                    HStack(spacing: 3) {
+                                                        Image(systemName: "doc.on.doc")
+                                                        Text("复制整段")
+                                                    }
+                                                    .font(.system(size: 10, weight: .medium))
+                                                    .foregroundColor(.gray)
+                                                    .padding(.horizontal, 6)
+                                                    .padding(.vertical, 3)
+                                                    .background(Color(white: 0.18))
+                                                    .cornerRadius(4)
+                                                }
+                                            }
+                                            .padding(.top, 4)
                                         }
                                     }
-                                    if cleaned.isEmpty {
-                                        Text("(无输出)")
-                                            .font(.system(.footnote, design: .monospaced))
-                                            .foregroundColor(Theme.textDim)
-                                    } else {
-                                        Text(cleaned)
-                                            .font(.system(.footnote, design: .monospaced))
-                                            .foregroundColor(Theme.text)
-                                            .textSelection(.enabled)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .padding(8)
+                                .background(Color(white: 0.05))
+                                .cornerRadius(6)
+                                .contextMenu {
+                                    Button {
+                                        copyBlock(item.output, tip: "已复制本段输出")
+                                    } label: {
+                                        Label("复制本段输出", systemImage: "doc.on.doc")
+                                    }
+
+                                    if item.command != "system" {
+                                        Button {
+                                            copyBlock(item.command, tip: "已复制命令")
+                                        } label: {
+                                            Label("仅复制命令", systemImage: "terminal")
+                                        }
                                     }
                                 }
-                                .padding(12)
-                                .background(RoundedRectangle(cornerRadius: 10).fill(Theme.bgElev))
+                                .id(item.id)
+                            }
+
+                            if session.isConnected && !session.shellPrompt.isEmpty {
+                                HStack(spacing: 0) {
+                                    Text(session.shellPrompt)
+                                        .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                        .foregroundColor(.cyan)
+                                    Text(" ")
+                                        .font(.system(size: 13, design: .monospaced))
+                                        .foregroundColor(.white)
+                                }
+                                .textSelection(.enabled)
+                                .padding(.horizontal, 8)
+                            }
+
+                            Color.clear
+                                .frame(height: 16)
+                                .id("BOTTOM_ANCHOR")
+                        }
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                    }
+                    .background(Color.black)
+                    .onTapGesture {
+                        showMiniKeyboard = false
+                        isSystemKeyboardFocused = false
+                    }
+                    .onChange(of: session.history.count) { _ in
+                        scrollToBottom(proxy: proxy)
+                    }
+                    .onChange(of: session.history.last?.output) { _ in
+                        scrollToBottom(proxy: proxy)
+                    }
+                    .onChange(of: session.shellPrompt) { _ in
+                        scrollToBottom(proxy: proxy)
+                    }
+                }
+
+                // MARK: - 系统键盘隐式输入框
+                TextField("", text: $inputCommand)
+                    .focused($isSystemKeyboardFocused)
+                    .frame(width: 0, height: 0)
+                    .opacity(0)
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+                    .onSubmit {
+                        executeCurrentInput()
+                    }
+                    .onChange(of: isSystemKeyboardFocused) { focused in
+                        if focused {
+                            showMiniKeyboard = false
+                        }
+                    }
+
+                // MARK: - 微型键盘
+                VStack(spacing: 6) {
+                    HStack(spacing: 8) {
+                        Button(action: { toggleMiniKeyboard() }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: showMiniKeyboard ? "chevron.down" : "keyboard")
+                                Text(showMiniKeyboard ? "收起" : "微型键盘")
+                            }
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundColor(.cyan)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color(white: 0.18))
+                            .cornerRadius(5)
+                        }
+
+                        Button(action: { toggleSystemKeyboard() }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: isSystemKeyboardFocused ? "chevron.down" : "character.cursor.ibeam")
+                                Text(isSystemKeyboardFocused ? "收起" : "系统键盘")
+                            }
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundColor(.orange)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color(white: 0.18))
+                            .cornerRadius(5)
+                        }
+
+                        Spacer()
+
+                        Text(session.isConnected ? "已连接" : "未连接")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundColor(session.isConnected ? .green : .red)
+                            .padding(.horizontal, 8)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.top, 6)
+
+                    HStack(spacing: 8) {
+                        Text(inputCommand.isEmpty
+                             ? (session.isConnected ? "已在线" : "未连接")
+                             : inputCommand)
+                            .font(.system(size: 13, design: .monospaced))
+                            .foregroundColor(inputCommand.isEmpty ? .gray : .green)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .lineLimit(1)
+
+                        if !inputCommand.isEmpty {
+                            Button(action: { inputCommand = "" }) {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundColor(.gray)
                             }
                         }
-                        .padding(12)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 4)
+
+                    if showMiniKeyboard {
+                        HStack(alignment: .top, spacing: 6) {
+                            VStack(spacing: 6) {
+                                HStack(spacing: 5) {
+                                    miniKey("1")
+                                    miniKey("2")
+                                    miniKey("3")
+                                    miniKey("4")
+                                    miniKey("5")
+                                    miniKey("k")
+                                }
+
+                                HStack(spacing: 5) {
+                                    miniKey("6")
+                                    miniKey("7")
+                                    miniKey("8")
+                                    miniKey("9")
+                                    miniKey("0")
+                                    miniKey("-")
+                                }
+
+                                HStack(spacing: 5) {
+                                    miniKey("Ctrl+C", color: .red) {
+                                        session.sendCtrlC()
+                                    }
+
+                                    miniKey("ESC", color: .orange) {
+                                        session.sendEscape()
+                                    }
+
+                                    miniKey("空格") {
+                                        inputCommand.append(" ")
+                                    }
+
+                                    miniKey("退格", icon: "delete.left") {
+                                        if !inputCommand.isEmpty {
+                                            inputCommand.removeLast()
+                                        }
+                                    }
+                                }
+
+                                // 原来的 88 已删除。
+                                // x-ui + q退出自动占满整行。
+                                HStack(spacing: 5) {
+                                    miniKey("x-ui") {
+                                        runCommand("x-ui", interactive: true)
+                                    }
+
+                                    miniKey("q退出", color: .purple) {
+                                        session.sendControl("q")
+                                    }
+                                }
+                            }
+
+                            VStack(spacing: 6) {
+                                Button(action: {
+                                    if let pasteString = UIPasteboard.general.string {
+                                        inputCommand.append(pasteString)
+                                        showToast("已粘贴剪贴板内容")
+                                    } else {
+                                        showToast("剪贴板为空")
+                                    }
+                                }) {
+                                    VStack(spacing: 2) {
+                                        Image(systemName: "doc.on.clipboard")
+                                            .font(.system(size: 15))
+
+                                        Text("粘贴")
+                                            .font(.system(size: 12, weight: .semibold))
+                                    }
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 56)
+                                    .background(Color.blue.opacity(0.35))
+                                    .foregroundColor(.white)
+                                    .cornerRadius(8)
+                                }
+
+                                Button(action: {
+                                    executeCurrentInput()
+                                }) {
+                                    VStack(spacing: 4) {
+                                        Image(systemName: "return")
+                                            .font(.system(size: 20, weight: .bold))
+
+                                        Text("回车")
+                                            .font(.system(size: 14, weight: .bold))
+                                    }
+                                    .frame(maxWidth: .infinity)
+                                    .frame(maxHeight: .infinity)
+                                    .background(Color.blue)
+                                    .foregroundColor(.white)
+                                    .cornerRadius(8)
+                                }
+                            }
+                            .frame(width: 78)
+                        }
+                        .frame(height: 176)
+                        .padding(.horizontal, 6)
+                        .padding(.bottom, 6)
                     }
                 }
+                .background(Color(white: 0.08))
             }
-            .navigationTitle("命令历史")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) { Button("关闭") { dismiss() } }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("复制全部") {
-                        let all = records.map { "$ \($0.command)\n\(TerminalColorizer.cleanOutput($0.output))" }.joined(separator: "\n\n")
-                        UIPasteboard.general.string = all
+
+            if let tip = copiedTip {
+                VStack {
+                    Spacer()
+
+                    Text(tip)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(Color.black.opacity(0.85))
+                        .cornerRadius(20)
+                        .padding(.bottom, 60)
+                }
+                .transition(.opacity)
+            }
+        }
+        .navigationTitle(serverName)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button(session.isConnected ? "断开" : "连接") {
+                    if session.isConnected {
+                        session.disconnect()
+                    } else {
+                        connectToServer()
                     }
                 }
             }
         }
-        .preferredColorScheme(.dark)
-    }
-}
+        .sheet(isPresented: $showingAddSheet) {
+            NavigationView {
+                Form {
+                    Section(header: Text("快捷键属性")) {
+                        TextField(
+                            "按键名称 (例如: 3x-ui / x-ui)",
+                            text: $newCmdName
+                        )
 
-// MARK: - 自定义键盘
-struct CustomKeyPanel: View {
-    let onInput: (String) -> Void
-    let onBackspace: () -> Void
-    let onCtrlC: () -> Void
-    let onEnter: () -> Void
-    let onPaste: () -> Void
-    let onShortcut: (String) -> Void
-    let onEsc: () -> Void
-    let onHide: () -> Void
-    let onSwitchToSystem: () -> Void
-
-    var body: some View {
-        VStack(spacing: 4) {
-            HStack(spacing: 6) {
-                Button { onHide() } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "keyboard.chevron.compact.down")
-                        Text("收起")
-                    }
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 10).padding(.vertical, 6)
-                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.3)))
-                }
-                .buttonStyle(.plain)
-                Button { onSwitchToSystem() } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "keyboard")
-                        Text("系统键盘")
-                    }
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(Theme.orange)
-                    .padding(.horizontal, 10).padding(.vertical, 6)
-                    .background(RoundedRectangle(cornerRadius: 6).fill(Theme.orange.opacity(0.2)))
-                }
-                .buttonStyle(.plain)
-                Spacer()
-                Text("已连接").font(.system(size: 12, weight: .medium)).foregroundColor(Theme.green)
-            }
-            .padding(.horizontal, 8).padding(.top, 6)
-
-            HStack(alignment: .top, spacing: 6) {
-                VStack(spacing: 4) {
-                    Text("已在线")
-                        .font(.system(size: 12))
-                        .foregroundColor(Theme.textDim)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    HStack(spacing: 4) {
-                        ForEach(["1","2","3","4","5","k"], id: \.self) { k in
-                            Button { onInput(k) } label: { keyLabel(k) }.buttonStyle(.plain)
-                        }
-                    }
-                    HStack(spacing: 4) {
-                        ForEach(["6","7","8","9","0","-"], id: \.self) { k in
-                            Button { onInput(k) } label: { keyLabel(k) }.buttonStyle(.plain)
-                        }
-                    }
-                    HStack(spacing: 4) {
-                        Button { onCtrlC() } label: {
-                            Text("Ctrl+C")
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 8)
-                                .background(RoundedRectangle(cornerRadius: 5).fill(Theme.red))
-                        }.buttonStyle(.plain)
-                        Button { onEsc() } label: {
-                            Text("ESC")
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 8)
-                                .background(RoundedRectangle(cornerRadius: 5).fill(Theme.orange))
-                        }.buttonStyle(.plain)
-                        Button { onInput(" ") } label: {
-                            Text("空格")
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 8)
-                                .background(RoundedRectangle(cornerRadius: 5).fill(Color.gray.opacity(0.25)))
-                        }.buttonStyle(.plain)
-                        Button { onBackspace() } label: {
-                            Image(systemName: "delete.left")
-                                .font(.system(size: 14))
-                                .foregroundColor(.white)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 8)
-                                .background(RoundedRectangle(cornerRadius: 5).fill(Color.gray.opacity(0.25)))
-                        }.buttonStyle(.plain)
-                    }
-                    HStack(spacing: 4) {
-                        Button { onShortcut("x-ui") } label: { customKeyLabel("x-ui", color: Color.gray.opacity(0.25)) }.buttonStyle(.plain)
-                        Button { onShortcut("88") } label: { customKeyLabel("88", color: Color.gray.opacity(0.25)) }.buttonStyle(.plain)
-                        Button { onShortcut("q") } label: { customKeyLabel("q退出", color: Theme.magenta) }.buttonStyle(.plain)
+                        TextField(
+                            "执行命令 (例如: x-ui)",
+                            text: $newCmdContent
+                        )
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
                     }
                 }
-                VStack(spacing: 4) {
-                    Button { onPaste() } label: {
-                        VStack(spacing: 4) {
-                            Image(systemName: "doc.on.clipboard")
-                            Text("粘贴").font(.system(size: 12, weight: .medium))
+                .navigationTitle("添加快捷键")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("取消") {
+                            showingAddSheet = false
                         }
-                        .foregroundColor(.white)
-                        .frame(width: 80, height: 56)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blue))
-                    }.buttonStyle(.plain)
-                    Button { onEnter() } label: {
-                        VStack(spacing: 4) {
-                            Image(systemName: "return")
-                            Text("回车").font(.system(size: 12, weight: .bold))
+                    }
+
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("保存") {
+                            addQuickCmd()
+                            showingAddSheet = false
                         }
-                        .foregroundColor(.white)
-                        .frame(width: 80, height: 56)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blue))
-                    }.buttonStyle(.plain)
+                        .disabled(
+                            newCmdName.trimmingCharacters(in: .whitespaces).isEmpty ||
+                            newCmdContent.trimmingCharacters(in: .whitespaces).isEmpty
+                        )
+                    }
                 }
             }
-            .padding(.horizontal, 8).padding(.bottom, 6)
         }
-        .background(Color(red: 0.06, green: 0.09, blue: 0.15))
-        .overlay(Rectangle().frame(height: 1).foregroundColor(Theme.stroke), alignment: .top)
+        .onAppear {
+            loadQuickCommands()
+
+            if !session.isConnected {
+                connectToServer()
+            }
+        }
+        .onChange(of: scenePhase) { phase in
+            switch phase {
+            case .background:
+                session.appDidEnterBackground()
+            case .active:
+                session.appWillEnterForeground()
+            default:
+                break
+            }
+        }
     }
 
-    private func keyLabel(_ t: String) -> some View {
-        Text(t)
-            .font(.system(size: 14, weight: .medium))
-            .foregroundColor(.white)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 8)
-            .background(RoundedRectangle(cornerRadius: 5).fill(Color.gray.opacity(0.25)))
-    }
-    private func customKeyLabel(_ t: String, color: Color) -> some View {
-        Text(t)
-            .font(.system(size: 12, weight: .medium))
-            .foregroundColor(.white)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 8)
-            .background(RoundedRectangle(cornerRadius: 5).fill(color))
-    }
-}
+    // MARK: - 复制
+    private func copyBlock(_ text: String, tip: String) {
+        let cleaned = stripANSIEscapeCodes(text)
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
 
-@main
-struct SSHBlackApp: App {
-    @StateObject var store = SessionStore()
-    @StateObject var shortcutStore = ShortcutStore()
-    init() { FontLoader.registerFonts() }
-    var body: some Scene {
-        WindowGroup {
-            RootView()
-                .environmentObject(store)
-                .environmentObject(shortcutStore)
-                .preferredColorScheme(.dark)
+        guard !cleaned.isEmpty else {
+            showToast("没有可复制的内容")
+            return
+        }
+
+        UIPasteboard.general.string = cleaned
+        showToast(tip)
+    }
+
+    private func commandBlock(for item: CommandHistoryItem) -> String {
+        let prompt = item.prompt.isEmpty
+            ? "\(username)@\(host):~#"
+            : item.prompt
+
+        let output = stripANSIEscapeCodes(item.output)
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if output.isEmpty {
+            return "\(prompt) \(item.command)"
+        }
+
+        return "\(prompt) \(item.command)\n\(output)"
+    }
+
+    // MARK: - ANSI
+    private func stripANSIEscapeCodes(_ text: String) -> String {
+        let pattern =
+            "\u{1B}(\\[[0-9;?]*[ -/]*[@-~]|\\][^\u{07}]*\u{07}|[()][A-Za-z0-9]|[@-Z\\\\^_])"
+
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return text
+        }
+
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+
+        return regex.stringByReplacingMatches(
+            in: text,
+            options: [],
+            range: range,
+            withTemplate: ""
+        )
+    }
+
+    @ViewBuilder
+    private func renderOutputLines(
+        _ fullText: String,
+        defaultColor: Color
+    ) -> some View {
+        let cleaned = stripANSIEscapeCodes(fullText)
+        let allLines = cleaned.components(separatedBy: "\n")
+
+        let isTruncated = allLines.count > maxRenderedLinesPerBlock
+        let lines = isTruncated
+            ? Array(allLines.suffix(maxRenderedLinesPerBlock))
+            : allLines
+
+        LazyVStack(alignment: .leading, spacing: 2) {
+            if isTruncated {
+                Text("⚠️ 输出过长（共 \(allLines.count) 行），仅显示最后 \(maxRenderedLinesPerBlock) 行。点击“复制整段”可获取已接收内容。")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.orange)
+                    .padding(.bottom, 2)
+            }
+
+            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                let isPromptLine =
+                    trimmed.hasPrefix("root@") ||
+                    trimmed.hasPrefix("user@") ||
+                    trimmed.contains("~#")
+
+                let copyValue = copyValueForOutputLine(line)
+                let isCopyableLine =
+                    !isPromptLine &&
+                    !trimmed.isEmpty &&
+                    copyValue != nil
+
+                if isCopyableLine {
+                    HStack(alignment: .center, spacing: 6) {
+                        Text(line)
+                            .font(.system(size: 13, design: .monospaced))
+                            .foregroundColor(defaultColor)
+                            .textSelection(.enabled)
+                            .frame(
+                                maxWidth: .infinity,
+                                alignment: .leading
+                            )
+
+                        Button {
+                            if let value = copyValue {
+                                UIPasteboard.general.string = value
+                                showToast("已复制: \(value)")
+                            }
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 11))
+                                .foregroundColor(.cyan)
+                                .padding(4)
+                                .background(Color(white: 0.2))
+                                .cornerRadius(4)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } else {
+                    Text(line.isEmpty ? " " : line)
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundColor(defaultColor)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+    }
+
+    private func copyValueForOutputLine(_ line: String) -> String? {
+        let trimmed =
+            line.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+
+        if trimmed.hasPrefix("http://") ||
+            trimmed.hasPrefix("https://") {
+            return trimmed
+        }
+
+        guard let colon = trimmed.firstIndex(of: ":") else {
+            return nil
+        }
+
+        let prefix = trimmed[..<colon]
+
+        if prefix == "http" || prefix == "https" {
+            return trimmed
+        }
+
+        let valueStart = trimmed.index(after: colon)
+
+        return String(trimmed[valueStart...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - 键盘
+    private func toggleMiniKeyboard() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            if showMiniKeyboard {
+                showMiniKeyboard = false
+            } else {
+                isSystemKeyboardFocused = false
+                showMiniKeyboard = true
+            }
+        }
+    }
+
+    private func toggleSystemKeyboard() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            if isSystemKeyboardFocused {
+                isSystemKeyboardFocused = false
+            } else {
+                showMiniKeyboard = false
+                isSystemKeyboardFocused = true
+            }
+        }
+    }
+
+    private func showToast(_ msg: String) {
+        withAnimation {
+            copiedTip = msg
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
+            withAnimation {
+                copiedTip = nil
+            }
+        }
+    }
+
+    private func miniKey(
+        _ label: String,
+        icon: String? = nil,
+        color: Color = Color(white: 0.22),
+        action: (() -> Void)? = nil
+    ) -> some View {
+        Button(action: {
+            if let action = action {
+                action()
+            } else {
+                inputCommand.append(label)
+            }
+        }) {
+            HStack(spacing: 2) {
+                if let icon = icon {
+                    Image(systemName: icon)
+                        .font(.system(size: 11))
+                }
+
+                Text(label)
+                    .font(
+                        .system(
+                            size: 13,
+                            weight: .medium,
+                            design: .monospaced
+                        )
+                    )
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 36)
+            .background(color)
+            .foregroundColor(.white)
+            .cornerRadius(6)
+        }
+    }
+
+    // MARK: - 滚动
+    private func scrollToBottom(proxy: ScrollViewProxy) {
+        DispatchQueue.main.async {
+            proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
+        }
+    }
+
+    // MARK: - SSH
+    private func connectToServer() {
+        session.host = host
+        session.port = port
+        session.username = username
+        session.password = password
+        session.connect()
+    }
+
+    private func executeCurrentInput() {
+        let cmd =
+            inputCommand.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+
+        guard !cmd.isEmpty else {
+            return
+        }
+
+        runCommand(cmd)
+        inputCommand = ""
+    }
+
+    private func runCommand(_ cmd: String, interactive: Bool = false) {
+        let trimmed = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if interactive || isInteractiveCommand(trimmed, name: nil) {
+            session.sendInteractiveCommand(trimmed)
+        } else {
+            session.sendCommand(trimmed)
+        }
+    }
+
+    private func isInteractiveCommand(_ cmd: String, name: String?) -> Bool {
+        let value = cmd.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if value == "x-ui" || value == "k" { return true }
+        if let name {
+            let n = name.lowercased()
+            if n.contains("x-ui") || (n.contains("k") && n.contains("菜单")) { return true }
+        }
+        return false
+    }
+
+    // MARK: - 快捷命令
+    private func loadQuickCommands() {
+        if let data = UserDefaults.standard.data(
+            forKey: storageKey
+        ),
+        let decoded = try? JSONDecoder().decode(
+            [QuickCmd].self,
+            from: data
+        ) {
+            quickCommands = decoded
+        } else {
+            quickCommands = [
+                QuickCmd(name: "输入 k 菜单", cmd: "k"),
+                QuickCmd(name: "面板管理 (x-ui)", cmd: "x-ui"),
+                QuickCmd(name: "查看文件 (ls)", cmd: "ls -la"),
+                QuickCmd(name: "磁盘空间 (df)", cmd: "df -h"),
+                QuickCmd(name: "系统信息 (uname)", cmd: "uname -a")
+            ]
+
+            saveQuickCommands()
+        }
+    }
+
+    private func copyAllQuickCommands() {
+        guard !quickCommands.isEmpty else {
+            showToast("暂无快捷命令")
+            return
+        }
+
+        let text = quickCommands.map { item in
+            "\(item.name) = \(item.cmd)"
+        }.joined(separator: "\n")
+
+        copyBlock(text, tip: "已复制全部快捷命令")
+    }
+
+    private func addQuickCmd() {
+        let name =
+            newCmdName.trimmingCharacters(in: .whitespaces)
+
+        let cmd =
+            newCmdContent.trimmingCharacters(in: .whitespaces)
+
+        guard !name.isEmpty, !cmd.isEmpty else {
+            return
+        }
+
+        quickCommands.append(
+            QuickCmd(name: name, cmd: cmd)
+        )
+
+        saveQuickCommands()
+
+        newCmdName = ""
+        newCmdContent = ""
+    }
+
+    private func deleteQuickCmd(_ item: QuickCmd) {
+        quickCommands.removeAll {
+            $0.id == item.id
+        }
+
+        saveQuickCommands()
+    }
+
+    private func saveQuickCommands() {
+        if let encoded = try? JSONEncoder().encode(
+            quickCommands
+        ) {
+            UserDefaults.standard.set(
+                encoded,
+                forKey: storageKey
+            )
         }
     }
 }
