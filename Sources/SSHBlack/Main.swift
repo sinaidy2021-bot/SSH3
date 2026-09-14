@@ -409,23 +409,37 @@ final class TerminalBridge: NSObject, TerminalViewDelegate {
     func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {}
 }
 
-// MARK: - 键盘互斥（三态严格管理）
+// MARK: - 键盘互斥（三态严格管理，彻底干掉系统键盘）
 enum KeyboardMode { case custom, system, hidden }
 
 class CustomTerminalView: TerminalView {
-    var allowSystemKeyboard: Bool = false {
-        didSet {
-            guard oldValue != allowSystemKeyboard else { return }
+    /// 是否允许系统键盘
+    var allowSystemKeyboard: Bool = false
+
+    /// 根源修复 1：用 canBecomeFirstResponder 彻底阻止在自定义模式下成为第一响应者
+    override var canBecomeFirstResponder: Bool {
+        return allowSystemKeyboard
+    }
+
+    /// 根源修复 2：强制清空 SwiftTerm 自带的 inputAccessoryView（esc/ctrl 工具栏），
+    /// 这个工具栏会在系统键盘弹出时自动出现，是导致“三层键盘打架”的罪魁祸首之一。
+    override var inputAccessoryView: UIView? {
+        get { return nil }
+        set { _ = newValue }
+    }
+
+    /// 根源修复 3：强制清空 inputView，让系统键盘在自定义模式下无内容可显示
+    override var inputView: UIView? {
+        get {
             if allowSystemKeyboard {
-                self.inputView = nil
-                self.reloadInputViews()
-                if !self.isFirstResponder { _ = self.becomeFirstResponder() }
+                // 系统键盘模式下返回 nil，让 iOS 显示默认键盘
+                return nil
             } else {
-                self.inputView = UIView()
-                self.reloadInputViews()
-                if self.isFirstResponder { self.resignFirstResponder() }
+                // 自定义模式下返回空视图，iOS 不会弹出任何键盘
+                return UIView()
             }
         }
+        set { _ = newValue }
     }
 }
 
@@ -441,9 +455,8 @@ struct TerminalWrapper: UIViewRepresentable {
         v.backgroundColor = UIColor(Theme.bg)
         v.nativeBackgroundColor = UIColor(Theme.bg)
         v.nativeForegroundColor = UIColor(Theme.text)
-        // 👈 字体：改为 monospacedSystemFont（SF Mono，iOS 16+ 中英文均等宽渲染），字号 15 更清晰
         v.font = UIFont.monospacedSystemFont(ofSize: 15, weight: .regular)
-        v.inputView = UIView()
+        v.allowSystemKeyboard = false
 
         ssh.onData = { [weak v] d in
             guard let v = v else { return }
@@ -460,7 +473,16 @@ struct TerminalWrapper: UIViewRepresentable {
     }
 
     func updateUIView(_ v: CustomTerminalView, context: Context) {
-        v.allowSystemKeyboard = (keyboardMode == .system)
+        let wantSystem = (keyboardMode == .system)
+        if v.allowSystemKeyboard != wantSystem {
+            v.allowSystemKeyboard = wantSystem
+            v.reloadInputViews()
+            if wantSystem {
+                if !v.isFirstResponder { _ = v.becomeFirstResponder() }
+            } else {
+                if v.isFirstResponder { v.resignFirstResponder() }
+            }
+        }
     }
 }
 
@@ -736,8 +758,7 @@ struct BufferSheet: View {
                                 if !block.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                                     VStack(alignment: .leading, spacing: 8) {
                                         HStack {
-                                            Text("输出块")
-                                                .font(.caption).foregroundColor(Theme.textDim)
+                                            Text("输出块").font(.caption).foregroundColor(Theme.textDim)
                                             Spacer()
                                             Button {
                                                 UIPasteboard.general.string = block
@@ -747,8 +768,7 @@ struct BufferSheet: View {
                                                     Image(systemName: "doc.on.doc")
                                                     Text("复制整段")
                                                 }
-                                                .font(.caption)
-                                                .foregroundColor(Theme.blue)
+                                                .font(.caption).foregroundColor(Theme.blue)
                                                 .padding(.horizontal, 8).padding(.vertical, 4)
                                                 .background(RoundedRectangle(cornerRadius: 6).fill(Theme.blueSoft))
                                             }
@@ -779,31 +799,22 @@ struct BufferSheet: View {
         .preferredColorScheme(.dark)
     }
 
-    // 👈 重写分块逻辑：从上往下扫描，遇提示符切块；首块无提示符自动合并到下一块
     private func parseBlocks() {
         let lines = rawText.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         var result: [String] = []
         var current: [String] = []
 
         for line in lines {
-            // 提示符判定：包含 @ 且包含 # 或 $
             let isPrompt = line.contains("@") && (line.contains("#") || line.contains("$"))
-
             if isPrompt {
-                // 遇到新提示符，把之前累积的收成一块
-                if !current.isEmpty {
-                    result.append(current.joined(separator: "\n"))
-                }
+                if !current.isEmpty { result.append(current.joined(separator: "\n")) }
                 current = [line]
             } else {
                 current.append(line)
             }
         }
-        if !current.isEmpty {
-            result.append(current.joined(separator: "\n"))
-        }
+        if !current.isEmpty { result.append(current.joined(separator: "\n")) }
 
-        // 首块若无提示符，说明提示符被滚出屏幕，把它并入第二块，避免出现"孤立"的顶部块
         if result.count >= 2 && !result[0].contains("@") {
             let first = result.removeFirst()
             result[0] = first + "\n" + result[0]
@@ -814,7 +825,7 @@ struct BufferSheet: View {
     }
 }
 
-// MARK: - 自定义底部键盘
+// MARK: - 自定义底部键盘（完全保持你的要求）
 struct CustomKeyPanel: View {
     let onKey: (Data) -> Void
     let onText: (String) -> Void
