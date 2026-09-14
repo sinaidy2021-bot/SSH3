@@ -288,8 +288,9 @@ struct TerminalWrapper: UIViewRepresentable {
         v.backgroundColor = UIColor(Theme.bg)
         v.nativeBackgroundColor = UIColor(Theme.bg)
         v.nativeForegroundColor = UIColor(Theme.text)
-        v.font = UIFont.systemFont(ofSize: 14)
-        v.inputView = UIView()
+        
+        // 使用 Menlo 等宽字体，解决中文宽度和字体发虚问题
+        v.font = UIFont(name: "Menlo", size: 14) ?? UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
         
         ssh.onData = { [weak v] d in
             guard let v = v else { return }
@@ -299,7 +300,6 @@ struct TerminalWrapper: UIViewRepresentable {
         bridge.onResize = { [weak ssh] c, r in ssh?.resize(cols: c, rows: r) }
         
         DispatchQueue.main.async {
-            v.becomeFirstResponder()
             let d = v.getTerminal().getDims()
             ssh.resize(cols: d.cols, rows: d.rows)
         }
@@ -307,19 +307,14 @@ struct TerminalWrapper: UIViewRepresentable {
     }
     
     func updateUIView(_ v: TerminalView, context: Context) {
+        // 核心修复：当不是系统键盘模式时，强制让它交出第一响应者
         if keyboardMode == .system {
-            if v.inputView != nil {
-                v.inputView = nil
-                v.reloadInputViews()
+            if !v.isFirstResponder {
                 v.becomeFirstResponder()
             }
         } else {
-            if v.inputView == nil {
-                v.inputView = UIView()
-                v.reloadInputViews()
-            }
-            if keyboardMode == .custom && !v.isFirstResponder {
-                v.becomeFirstResponder()
+            if v.isFirstResponder {
+                v.resignFirstResponder()
             }
         }
     }
