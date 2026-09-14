@@ -16,15 +16,12 @@ jobs:
 
       - name: 生成 Xcode 工程
         run: |
-          echo "👉 正在生成 Xcode 工程文件..."
+          echo "👉 生成 Xcode 工程..."
           xcodegen generate
-          echo "✅ 工程文件生成完毕"
+          echo "✅ 生成完毕"
 
       - name: 构建模拟器版本
         run: |
-          echo "👉 当前 Xcode 版本："
-          xcodebuild -version
-          
           echo "👉 开始编译..."
           
           set +e
@@ -43,16 +40,16 @@ jobs:
           set -e
           
           if [ $EXIT_CODE -eq 0 ]; then
-            echo "🎉 构建成功！
-
-"
+            echo "🎉 构建成功！"
           else
             echo "========================================"
-            echo "❌ 构建失败！以下是日志末尾的 100 行，真正的报错一定在这里面："
+            echo "❌ 构建失败！以下是日志最末尾的 100 行报错："
             echo "========================================"
             tail -n 100 build_log.txt
             exit 1
-          fi      - name: 上传产物
+          fi
+
+      - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: SSHBlack-模拟器版
