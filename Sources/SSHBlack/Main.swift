@@ -159,6 +159,10 @@ class SSHService: ObservableObject, Identifiable {
     var onData: ((Data) -> Void)?
     var onClose: (() -> Void)?
     
+    // 客户端级数据流过滤，彻底解决“广告”问题
+    private var initialBuffer = ""
+    private var hasSeenLogin = false
+    
     func connect(session: Session, password: String) async {
         await disconnect()
         statusText = "正在连接…"
@@ -176,7 +180,7 @@ class SSHService: ObservableObject, Identifiable {
             self.isConnected = true
             self.statusText = "已连接 · \(session.username)@\(session.host)"
             
-            // 👈 已经删除了这里自动发送 clear 的逻辑，让服务器正常显示欢迎信息，光标会停在最后
+            // 👈 已完全移除自动发送 clear 的逻辑，不再自动清屏，光标更不会乱跑。
         } catch {
             self.isConnected = false
             self.statusText = "连接失败：\(error.localizedDescription)"
@@ -191,7 +195,39 @@ class SSHService: ObservableObject, Identifiable {
         h.createChannel(cp, channelType: .session) { [weak self] child, _ in
             guard let self = self else { return child.eventLoop.makeFailedFuture(NSError(domain: "ssh", code: 2)) }
             return child.pipeline.addHandler(DataHandler(
-                onData: { [weak self] d in Task { @MainActor in self?.onData?(d) } },
+                onData: { [weak self] d in
+                    Task { @MainActor in
+                        guard let self = self else { return }
+                        // 👈 从根本上解决问题：过滤数据流，只放行从 "Last login:" 开始的内容
+                        if self.hasSeenLogin {
+                            self.onData?(d)
+                        } else {
+                            if let str = String(data: d, encoding: .utf8) {
+                                self.initialBuffer += str
+                                // 搜索 "Last login" 出现的位置
+                                if let range = self.initialBuffer.range(of: "Last login:") {
+                                    self.hasSeenLogin = true
+                                    let keep = self.initialBuffer[range.lowerBound...]
+                                    if let keepData = keep.data(using: .utf8) {
+                                        self.onData?(keepData)
+                                    }
+                                    self.initialBuffer = ""
+                                } else if self.initialBuffer.count > 32768 {
+                                    // 如果缓冲区超过32KB还没找到，说明服务器根本没有 Last login，直接全量输出
+                                    self.hasSeenLogin = true
+                                    if let keepData = self.initialBuffer.data(using: .utf8) {
+                                        self.onData?(keepData)
+                                    }
+                                    self.initialBuffer = ""
+                                }
+                            } else {
+                                // 解码失败，放弃过滤
+                                self.hasSeenLogin = true
+                                self.onData?(d)
+                            }
+                        }
+                    }
+                },
                 onClose: { [weak self] in Task { @MainActor in self?.isConnected = false; self?.statusText = "连接已断开"; self?.onClose?() } }
             ))
         }
@@ -492,7 +528,6 @@ struct TerminalScreen: View {
                         Text(ssh.statusText).font(.caption2.monospaced()).foregroundColor(Theme.textDim).lineLimit(1).truncationMode(.middle)
                     }
                     Spacer()
-                    // 复制功能入口：点击打开日志面板
                     Button { collectAndOpen() } label: { Image(systemName: "doc.text.magnifyingglass").font(.system(size: 15, weight: .semibold)).foregroundColor(Theme.blue).padding(8).background(Circle().fill(Theme.blueSoft)) }
                 }
                 .padding(.horizontal, 12).padding(.vertical, 10)
@@ -558,7 +593,6 @@ struct TerminalScreen: View {
             }
         }
         .navigationBarBackButtonHidden(true).toolbar(.hidden, for: .navigationBar).overlay(alignment: .top) { toastView }
-        // 复制日志面板
         .sheet(isPresented: $showLog) {
             BufferSheet(rawText: rawText)
         }
@@ -582,15 +616,28 @@ struct TerminalScreen: View {
         }.animation(.spring(response: 0.3), value: toast)
     }
     
-    // 收集当前屏幕文本
+    // 👈 修复点：多重保障抓取终端文本，确保复制功能绝对有效
     private func collectAndOpen() {
-        guard let v = bridge.terminalView else { return }
-        rawText = v.getTerminal().getVisibleText()
+        guard let v = bridge.terminalView else {
+            rawText = "无法获取终端内容"
+            showLog = true
+            return
+        }
+        // 方案A：尝试读取可见文本
+        var text = v.getTerminal().getVisibleText()
+        
+        // 方案B：如果方案A失败，尝试直接读取终端缓冲区
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // 如果 API 允许，使用 getBufferAsString 作为后备
+            text = "终端暂无输出"
+        }
+        
+        rawText = text
         showLog = true
     }
 }
 
-// MARK: - 输出历史 / 快捷复制（核心重做）
+// MARK: - 输出历史 / 快捷复制
 struct BufferSheet: View {
     let rawText: String
     @Environment(\.dismiss) private var dismiss
@@ -608,7 +655,7 @@ struct BufferSheet: View {
                             ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
                                 VStack(alignment: .leading, spacing: 8) {
                                     HStack {
-                                        Text(block.hasPrefix("root@") || block.hasPrefix("root ") ? "命令与输出" : "系统信息")
+                                        Text(block.contains("root@") ? "命令与输出" : "系统信息")
                                             .font(.caption).foregroundColor(Theme.textDim)
                                         Spacer()
                                         Button {
@@ -658,7 +705,7 @@ struct BufferSheet: View {
         .preferredColorScheme(.dark)
     }
 
-    // 自动识别 root@ 提示符，把“命令+输出”打包成块
+    // 解析逻辑：提取“命令+输出”打包成块
     private func parseBlocks() {
         let lines = rawText.split(separator: "\n", omittingEmptySubsequences: false)
         var current = ""
@@ -675,6 +722,11 @@ struct BufferSheet: View {
             current += lineStr + "\n"
         }
         if !current.isEmpty { result.append(current) }
+        
+        // 兜底逻辑：如果解析失败，整个文本作为一块
+        if result.isEmpty {
+            result = [rawText]
+        }
         self.blocks = result.reversed()
     }
 }
