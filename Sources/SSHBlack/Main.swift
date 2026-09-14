@@ -9,16 +9,18 @@ import SwiftTerm
 
 typealias Color = SwiftUI.Color
 
-// MARK: - 主题
+// MARK: - 蓝黑主题（完全摒弃绿色）
 enum Theme {
-    static let neon = Color(red: 0.00, green: 0.93, blue: 0.62)
-    static let neonSoft = Color(red: 0.00, green: 0.93, blue: 0.62).opacity(0.15)
-    static let violet = Color(red: 0.55, green: 0.42, blue: 1.00)
-    static let bg = Color(red: 0.02, green: 0.02, blue: 0.04)
-    static let bgElev = Color(red: 0.06, green: 0.06, blue: 0.09)
-    static let stroke = Color.white.opacity(0.08)
-    static let text = Color.white.opacity(0.92)
-    static let textDim = Color.white.opacity(0.55)
+    static let blue        = Color(red: 0.00, green: 0.48, blue: 1.00)   // iOS 科技蓝
+    static let blueSoft    = Color(red: 0.00, green: 0.48, blue: 1.00).opacity(0.15)
+    static let bg          = Color(red: 0.02, green: 0.04, blue: 0.08)   // 蓝黑
+    static let bgElev      = Color(red: 0.06, green: 0.09, blue: 0.15)   // 卡片蓝黑
+    static let stroke      = Color.white.opacity(0.08)
+    static let text        = Color.white.opacity(0.92)
+    static let textDim     = Color.white.opacity(0.55)
+    static let red         = Color(red: 1.00, green: 0.30, blue: 0.30)   // Ctrl+C 红
+    static let orange      = Color(red: 1.00, green: 0.58, blue: 0.00)   // ESC 橙
+    static let magenta     = Color(red: 1.00, green: 0.40, blue: 0.80)   // q退出 粉
 }
 
 // MARK: - 快捷指令模型
@@ -34,35 +36,25 @@ class ShortcutStore: ObservableObject {
     private let key = "sshblack.shortcuts.v1"
     
     init() { load() }
-    
     func load() {
         guard let data = UserDefaults.standard.data(forKey: key),
               let list = try? JSONDecoder().decode([Shortcut].self, from: data) else {
             shortcuts = [
-                Shortcut(name: "查看文件", command: "ls -la"),
-                Shortcut(name: "查看网络", command: "ifconfig"),
-                Shortcut(name: "磁盘空间", command: "df -h"),
-                Shortcut(name: "进程管理", command: "top")
+                Shortcut(name: "输入 k 菜单", command: "k"),
+                Shortcut(name: "面板管理 (x-ui)", command: "x-ui"),
+                Shortcut(name: "查看文件 (ls)", command: "ls -la"),
+                Shortcut(name: "磁盘空间", command: "df -h")
             ]
             return
         }
         shortcuts = list
     }
-    
     func save() {
         guard let data = try? JSONEncoder().encode(shortcuts) else { return }
         UserDefaults.standard.set(data, forKey: key)
     }
-    
-    func add(_ s: Shortcut) {
-        shortcuts.append(s)
-        save()
-    }
-    
-    func delete(_ s: Shortcut) {
-        shortcuts.removeAll { $0.id == s.id }
-        save()
-    }
+    func add(_ s: Shortcut) { shortcuts.append(s); save() }
+    func delete(_ s: Shortcut) { shortcuts.removeAll { $0.id == s.id }; save() }
 }
 
 // MARK: - 会话模型
@@ -184,19 +176,19 @@ class SSHService: ObservableObject, Identifiable {
             self.isConnected = true
             self.statusText = "已连接 · \(session.username)@\(session.host)"
             
-            // 连接后自动清屏（抹掉 Ubuntu 广告）
+            // 连接后自动清屏，抹掉 Ubuntu 广告
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                 self?.sendText("clear\n")
             }
-        } catch {
+        } catchBridge {
             self.isConnected = false
-            self.statusText = "连接失败：\(error.localizedDescription)"
+            self.status:Text = "连接失败：\(error.localized NSDescription)"
             await disconnect()
         }
     }
     
-    private func openShell(cols: Int, rows: Int) async throws {
-        guard let p = parent else { throw NSError(domain: "ssh", code: 1) }
+    private func openShell(colsObject: Int, rows: Int) async throws, {
+        guard let p = parent else { throw Terminal NSError(domain: "ssh", code: 1) }
         let h = try await p.pipeline.handler(type: NIOSSHHandler.self).get()
         let cp = p.eventLoop.makePromise(of: Channel.self)
         h.createChannel(cp, channelType: .session) { [weak self] child, _ in
@@ -243,20 +235,12 @@ class SSHService: ObservableObject, Identifiable {
 class SSHManager: ObservableObject {
     static let shared = SSHManager()
     @Published var services: [UUID: SSHService] = [:]
-    
     func service(for session: Session) -> SSHService {
         if let s = services[session.id] { return s }
         let s = SSHService()
         services[session.id] = s
         return s
     }
-}
-
-// MARK: - 键盘模式
-enum KeyboardMode {
-    case custom   // 自定义紧凑键盘
-    case system   // 系统原生键盘
-    case hidden   // 全部隐藏
 }
 
 // MARK: - SwiftTerm 终端桥接
@@ -270,7 +254,7 @@ extension Terminal {
     }
 }
 
-final class TerminalBridge: NSObject, TerminalViewDelegate {
+final class TerminalViewDelegate {
     weak var terminalView: TerminalView?
     var onInput: ((Data) -> Void)?
     var onResize: ((Int, Int) -> Void)?
@@ -286,6 +270,13 @@ final class TerminalBridge: NSObject, TerminalViewDelegate {
     func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {}
 }
 
+// MARK: - 键盘互斥核心逻辑
+enum KeyboardMode {
+    case custom   // 自定义面板
+    case system   // 原生系统键盘
+    case hidden   // 全部隐藏
+}
+
 struct TerminalWrapper: UIViewRepresentable {
     @ObservedObject var ssh: SSHService
     let bridge: TerminalBridge
@@ -298,8 +289,12 @@ struct TerminalWrapper: UIViewRepresentable {
         v.backgroundColor = UIColor(Theme.bg)
         v.nativeBackgroundColor = UIColor(Theme.bg)
         v.nativeForegroundColor = UIColor(Theme.text)
+        
+        // 字体适配：解决 iPhone 13 国行中文字间距异常
         v.font = UIFont.systemFont(ofSize: 14)
-        v.inputView = UIView() // 默认屏蔽系统键盘
+        
+        // 默认屏蔽系统键盘
+        v.inputView = UIView()
         
         ssh.onData = { [weak v] d in
             guard let v = v else { return }
@@ -318,13 +313,14 @@ struct TerminalWrapper: UIViewRepresentable {
     
     func updateUIView(_ v: TerminalView, context: Context) {
         if keyboardMode == .system {
+            // 切换系统键盘：解除屏蔽，弹起原生
             if v.inputView != nil {
                 v.inputView = nil
                 v.reloadInputViews()
                 v.becomeFirstResponder()
             }
         } else {
-            // 自定义键盘或隐藏状态，一律屏蔽系统键盘
+            // 自定义或隐藏：坚决屏蔽原生键盘
             if v.inputView == nil {
                 v.inputView = UIView()
                 v.reloadInputViews()
@@ -338,7 +334,7 @@ struct TerminalWrapper: UIViewRepresentable {
 
 // MARK: - 主界面
 struct RootView: View {
-    var body: some View { NavigationStack { SessionListView() }.tint(Theme.neon) }
+    var body: some View { NavigationStack { SessionListView() }.tint(Theme.blue) }
 }
 
 struct SessionListView: View {
@@ -354,17 +350,17 @@ struct SessionListView: View {
             VStack(spacing: 0) {
                 HStack {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("SSH 黑").font(.system(size: 34, weight: .heavy, design: .rounded)).foregroundColor(Theme.neon)
+                        Text("SSH 黑").font(.system(size: 34, weight: .heavy, design: .rounded)).foregroundColor(Theme.blue)
                         Text("\(store.sessions.count) 个会话").font(.caption).foregroundColor(Theme.textDim)
                     }
                     Spacer()
                     Button { showShortcuts = true } label: {
-                        Image(systemName: "slider.horizontal.3").font(.system(size: 18, weight: .bold)).foregroundColor(Theme.neon)
-                            .frame(width: 40, height: 40).background(Circle().fill(Theme.neonSoft))
+                        Image(systemName: "slider.horizontal.3").font(.system(size: 18, weight: .bold)).foregroundColor(Theme.blue)
+                            .frame(width: 40, height: 40).background(Circle().fill(Theme.blueSoft))
                     }
                     Button { isNew = true; editing = Session(name: "", host: "", username: "") } label: {
                         Image(systemName: "plus").font(.system(size: 18, weight: .bold)).foregroundColor(.black)
-                            .frame(width: 40, height: 40).background(Circle().fill(Theme.neon))
+                            .frame(width: 40, height: 40).background(Circle().fill(Theme.blue))
                     }
                 }.padding()
                 
@@ -467,7 +463,7 @@ struct SessionEditView: View {
     }
 }
 
-// MARK: - 终端页面
+// MARK: - 终端页面（完美布局与互斥键盘）
 struct TerminalScreen: View {
     let session: Session
     @EnvironmentObject var shortcutStore: ShortcutStore
@@ -478,8 +474,8 @@ struct TerminalScreen: View {
     @State private var toast: String?
     @State private var showLog = false
     @State private var lines: [String] = []
-    @State private var keyboardMode: KeyboardMode = .custom // 默认显示自定义键盘
     @State private var showShortcuts = false
+    @State private var keyboardMode: KeyboardMode = .custom // 默认自定义键盘
     
     init(session: Session) {
         self.session = session
@@ -490,35 +486,35 @@ struct TerminalScreen: View {
         ZStack {
             Theme.bg.ignoresSafeArea()
             VStack(spacing: 0) {
-                // 顶部状态栏
+                // 1. 顶部状态栏
                 HStack {
                     Button { dismiss() } label: {
-                        Image(systemName: "chevron.left").font(.system(size: 16, weight: .bold)).foregroundColor(Theme.neon).padding(8).background(Circle().fill(Theme.neonSoft))
+                        Image(systemName: "chevron.left").font(.system(size: 16, weight: .bold)).foregroundColor(Theme.blue).padding(8).background(Circle().fill(Theme.blueSoft))
                     }
-                    Circle().fill(ssh.isConnected ? Color.green : Color.red).frame(width: 8, height: 8)
+                    Circle().fill(ssh.isConnected ? Color.green : Theme.red).frame(width: 8, height: 8)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(session.shortName).font(.system(.subheadline, design: .rounded).weight(.semibold)).foregroundColor(Theme.text).lineLimit(1)
                         Text(ssh.statusText).font(.caption2.monospaced()).foregroundColor(Theme.textDim).lineLimit(1).truncationMode(.middle)
                     }
                     Spacer()
-                    Button { collectAndOpen() } label: { Image(systemName: "doc.text.magnifyingglass").font(.system(size: 15, weight: .semibold)).foregroundColor(Theme.neon).padding(8).background(Circle().fill(Theme.neonSoft)) }
+                    Button { collectAndOpen() } label: { Image(systemName: "doc.text.magnifyingglass").font(.system(size: 15, weight: .semibold)).foregroundColor(Theme.blue).padding(8).background(Circle().fill(Theme.blueSoft)) }
                 }
                 .padding(.horizontal, 12).padding(.vertical, 10)
                 .background(Color.black.opacity(0.8))
                 
-                // 快捷指令栏
+                // 2. 快捷指令栏
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         Button { showShortcuts = true } label: {
-                            Text("+ 管理").font(.system(.caption, design: .rounded).weight(.medium)).foregroundColor(Theme.neon)
+                            Text("+ 添加").font(.system(.caption, design: .rounded).weight(.medium)).foregroundColor(Theme.blue)
                                 .padding(.horizontal, 12).padding(.vertical, 8)
-                                .background(RoundedRectangle(cornerRadius: 8).fill(Theme.neonSoft))
+                                .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blueSoft))
                         }
                         ForEach(shortcutStore.shortcuts) { s in
                             Button { ssh.sendText(s.command + "\n") } label: {
-                                Text(s.name).font(.system(.caption, design: .rounded).weight(.medium)).foregroundColor(Theme.neon)
+                                Text(s.name).font(.system(.caption, design: .rounded).weight(.medium)).foregroundColor(Theme.blue)
                                     .padding(.horizontal, 12).padding(.vertical, 8)
-                                    .background(RoundedRectangle(cornerRadius: 8).fill(Theme.neonSoft))
+                                    .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blueSoft))
                             }
                         }
                     }.padding(.horizontal, 8).padding(.vertical, 6)
@@ -526,20 +522,20 @@ struct TerminalScreen: View {
                 .background(Color.black.opacity(0.5))
                 .sheet(isPresented: $showShortcuts) { ShortcutEditView().environmentObject(shortcutStore) }
                 
-                // 终端区域
+                // 3. 终端区域
                 ZStack {
                     TerminalWrapper(ssh: ssh, bridge: bridge, keyboardMode: $keyboardMode)
                         .background(Theme.bg)
                     
-                    // 点击终端可以隐藏所有键盘
-                    if keyboardMode != .hidden {
+                    // 如果键盘全部隐藏，点击终端恢复自定义键盘
+                    if keyboardMode == .hidden {
                         Color.clear.contentShape(Rectangle()).onTapGesture {
-                            keyboardMode = .hidden
+                            keyboardMode = .custom
                         }
                     }
                 }
                 
-                // 底部工具栏 + 键盘
+                // 4. 底部键盘区域
                 if keyboardMode == .custom {
                     CustomKeyPanel(
                         onKey: { ssh.send($0) },
@@ -548,18 +544,13 @@ struct TerminalScreen: View {
                         onSwitchToSystem: { keyboardMode = .system }
                     )
                 } else if keyboardMode == .hidden {
+                    // 隐藏模式：底部显示微缩工具条
                     HStack {
-                        Button {
-                            keyboardMode = .custom
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: "keyboard")
-                                Text("微缩键盘")
-                            }
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundColor(Theme.neon)
-                            .padding(.horizontal, 12).padding(.vertical, 8)
-                            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.neonSoft))
+                        Button { keyboardMode = .custom } label: {
+                            HStack(spacing: 4) { Image(systemName: "keyboard"); Text("微缩键盘") }
+                                .font(.system(size: 13, weight: .medium)).foregroundColor(Theme.blue)
+                                .padding(.horizontal, 12).padding(.vertical, 8)
+                                .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blueSoft))
                         }
                         Spacer()
                         Text("已在线").font(.caption).foregroundColor(Theme.textDim)
@@ -567,7 +558,7 @@ struct TerminalScreen: View {
                         Button { ssh.send(Data([0x0D])) } label: {
                             Text("回车").font(.system(size: 14, weight: .bold)).foregroundColor(.white)
                                 .padding(.horizontal, 20).padding(.vertical, 8)
-                                .background(RoundedRectangle(cornerRadius: 8).fill(Color.blue))
+                                .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blue))
                         }
                     }
                     .padding(.horizontal, 8).padding(.vertical, 6)
@@ -583,11 +574,11 @@ struct TerminalScreen: View {
                         HStack {
                             Text(line).font(.footnote).textSelection(.enabled)
                             Spacer()
-                            Button { UIPasteboard.general.string = line } label: { Image(systemName: "doc.on.doc").foregroundColor(Theme.neon) }
+                            Button { UIPasteboard.general.string = line } label: { Image(systemName: "doc.on.doc").foregroundColor(Theme.blue) }
                         }
                     }
                 }
-                .navigationTitle("输出历史")
+                .navigationTitle("输出历史 / 快捷复制")
                 .toolbar { ToolbarItem(placement: .topBarLeading) { Button("关闭") { showLog = false } }; ToolbarItem(placement: .topBarTrailing) { Button("复制全部") { UIPasteboard.general.string = lines.joined(separator: "\n") } } }
             }
         }
@@ -595,12 +586,9 @@ struct TerminalScreen: View {
             let pw = KeychainHelper.read(account: "session.\(session.id.uuidString).password") ?? ""
             if !ssh.isConnected { await ssh.connect(session: session, password: pw) }
         }
-        .onDisappear { /* 保持连接 */ }
+        .onDisappear { /* 退出保持连接，不主动断开 */ }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
-            // 系统键盘收起时，如果当前是系统键盘模式，自动切回自定义键盘
-            if keyboardMode == .system {
-                keyboardMode = .custom
-            }
+            if keyboardMode == .system { keyboardMode = .custom }
         }
     }
     
@@ -608,7 +596,7 @@ struct TerminalScreen: View {
         Group {
             if let toast = toast {
                 Text(toast).font(.system(.caption, design: .rounded).weight(.medium)).foregroundColor(.black)
-                    .padding(.horizontal, 14).padding(.vertical, 8).background(Capsule().fill(Theme.neon))
+                    .padding(.horizontal, 14).padding(.vertical, 8).background(Capsule().fill(Theme.blue))
                     .padding(.top, 60).transition(.move(edge: .top).combined(with: .opacity))
             }
         }.animation(.spring(response: 0.3), value: toast)
@@ -622,111 +610,118 @@ struct TerminalScreen: View {
     }
 }
 
-// MARK: - 自定义紧凑键盘（方案 B）
+// MARK: - 参考你截图的完美键盘布局
 struct CustomKeyPanel: View {
     let onKey: (Data) -> Void
     let onText: (String) -> Void
     let onHide: () -> Void
     let onSwitchToSystem: () -> Void
     
-    let rows: [[String]] = [
-        ["1","2","3","4","5","6","7","8","9","0","-","/"],
-        ["q","w","e","r","t","y","u","i","o","p"],
-        ["a","s","d","f","g","h","j","k","l"],
-        ["z","x","c","v","b","n","m",".","_"]
+    // 左侧按键布局
+    let leftKeys: [[String]] = [
+        ["1","2","3","4","5","k"],
+        ["6","7","8","9","0","-"]
     ]
     
     var body: some View {
         VStack(spacing: 4) {
-            // 第一行：控制栏
-            HStack(spacing: 6) {
-                Button {
-                    onHide()
-                } label: {
-                    HStack(spacing: 2) {
-                        Image(systemName: "keyboard.chevron.compact.down")
-                        Text("收起")
-                    }
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 10).padding(.vertical, 6)
-                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.3)))
-                }.buttonStyle(.plain)
-                
-                Button {
-                    onSwitchToSystem()
-                } label: {
-                    HStack(spacing: 2) {
-                        Image(systemName: "keyboard")
-                        Text("系统键盘")
-                    }
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.orange)
-                    .padding(.horizontal, 10).padding(.vertical, 6)
-                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.2)))
+            // 第一行：收起 + 系统键盘
+            HStack(spacing: 8) {
+                Button { onHide() } label: {
+                    HStack(spacing: 4) { Image(systemName: "keyboard.chevron.compact.down"); Text("收起") }
+                        .font(.system(size: 13, weight: .medium)).foregroundColor(.white)
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.3)))
                 }.buttonStyle(.plain)
                 
                 Spacer()
                 
-                Button {
-                    onKey(Data([0x03])) // Ctrl+C
-                } label: {
-                    Text("Ctrl+C").font(.system(size: 12, weight: .medium)).foregroundColor(.white)
-                        .padding(.horizontal, 10).padding(.vertical, 6)
-                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.red.opacity(0.6)))
-                }.buttonStyle(.plain)
-                
-                Button {
-                    onKey(Data([0x1B])) // ESC
-                } label: {
-                    Text("ESC").font(.system(size: 12, weight: .medium)).foregroundColor(.white)
-                        .padding(.horizontal, 10).padding(.vertical, 6)
-                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.6)))
-                }.buttonStyle(.plain)
-                
-                Button {
-                    onKey(Data([0x0D])) // 回车
-                } label: {
-                    Text("回车").font(.system(size: 14, weight: .bold)).foregroundColor(.white)
-                        .padding(.horizontal, 14).padding(.vertical, 6)
-                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.blue))
+                Button { onSwitchToSystem() } label: {
+                    HStack(spacing: 4) { Image(systemName: "keyboard"); Text("系统键盘") }
+                        .font(.system(size: 13, weight: .medium)).foregroundColor(Theme.orange)
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(Theme.orange.opacity(0.2)))
                 }.buttonStyle(.plain)
             }
-            .padding(.horizontal, 6).padding(.top, 4)
+            .padding(.horizontal, 8).padding(.top, 6)
             
-            // 字母数字行
-            ForEach(rows.indices, id: \.self) { idx in
-                HStack(spacing: 4) {
-                    ForEach(rows[idx], id: \.self) { key in
-                        Button { onText(key) } label: {
-                            Text(key).font(.system(size: 14, weight: .medium)).foregroundColor(.white)
+            // 下半部分：左侧九宫格 + 右侧大按钮
+            HStack(alignment: .top, spacing: 6) {
+                // 左侧区域
+                VStack(spacing: 4) {
+                    // 数字行
+                    ForEach(leftKeys.indices, id: \.self) { idx in
+                        HStack(spacing: 4) {
+                            ForEach(leftKeys[idx], id: \.self) { key in
+                                Button { onText(key) } label: {
+                                    Text(key).font(.system(size: 14, weight: .medium)).foregroundColor(.white)
+                                        .frame(maxWidth: .infinity).padding(.vertical, 8)
+                                        .background(RoundedRectangle(cornerRadius: 5).fill(Color.gray.opacity(0.25)))
+                                }.buttonStyle(.plain)
+                            }
+                        }
+                    }
+                    
+                    // 功能键行：Ctrl+C, ESC, 空格, 退格
+                    HStack(spacing: 4) {
+                        Button { onKey(Data([0x03])) } label: {
+                            Text("Ctrl+C").font(.system(size: 12, weight: .medium)).foregroundColor(.white)
+                                .frame(maxWidth: .infinity).padding(.vertical, 8)
+                                .background(RoundedRectangle(cornerRadius: 5).fill(Theme.red))
+                        }.buttonStyle(.plain)
+                        Button { onKey(Data([0x1B])) } label: {
+                            Text("ESC").font(.system(size: 12, weight: .medium)).foregroundColor(.white)
+                                .frame(maxWidth: .infinity).padding(.vertical, 8)
+                                .background(RoundedRectangle(cornerRadius: 5).fill(Theme.orange))
+                        }.buttonStyle(.plain)
+                        Button { onText(" ") } label: {
+                            Text("空格").font(.system(size: 12, weight: .medium)).foregroundColor(.white)
                                 .frame(maxWidth: .infinity).padding(.vertical, 8)
                                 .background(RoundedRectangle(cornerRadius: 5).fill(Color.gray.opacity(0.25)))
                         }.buttonStyle(.plain)
-                    }
-                    if idx == rows.count - 1 {
-                        // 最后一行加退格
                         Button { onKey(Data([0x7F])) } label: {
                             Image(systemName: "delete.left").font(.system(size: 14)).foregroundColor(.white)
                                 .frame(maxWidth: .infinity).padding(.vertical, 8)
                                 .background(RoundedRectangle(cornerRadius: 5).fill(Color.gray.opacity(0.25)))
                         }.buttonStyle(.plain)
                     }
-                }.padding(.horizontal, 6)
+                    
+                    // 底部快捷行：x-ui, 88, q退出
+                    HStack(spacing: 4) {
+                        Button { onText("x-ui") } label: { keyButtonLabel("x-ui", color: Color.gray.opacity(0.25)) }
+                        Button { onText("88") } label: { keyButtonLabel("88", color: Color.gray.opacity(0.25)) }
+                        Button { onText("q") } label: { keyButtonLabel("q退出", color: Theme.magenta) }
+                    }
+                }
+                
+                // 右侧大按钮：粘贴 / 回车
+                VStack(spacing: 4) {
+                    Button { 
+                        if let str = UIPasteboard.general.string { onText(str) }
+                    } label: {
+                        VStack(spacing: 4) {
+                            Image(systemName: "doc.on.clipboard")
+                            Text("粘贴").font(.system(size: 12, weight: .medium))
+                        }
+                        .foregroundColor(.white)
+                        .frame(width: 80, height: 56)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blue))
+                    }.buttonStyle(.plain)
+                    
+                    Button { onKey(Data([0x0D])) } label: {
+                        VStack(spacing: 4) {
+                            Image(systemName: "return")
+                            Text("回车").font(.system(size: 12, weight: .bold))
+                        }
+                        .foregroundColor(.white)
+                        .frame(width: 80, height: 56)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blue))
+                    }.buttonStyle(.plain)
+                }
             }
-            
-            // 底部功能键
-            HStack(spacing: 4) {
-                Button { onKey(Data([0x09])) } label: { keyButtonLabel("Tab", color: .gray.opacity(0.25)) }
-                Button { onText(" ") } label: { keyButtonLabel("空格", color: .gray.opacity(0.25)) }
-                Button { onText("x-ui") } label: { keyButtonLabel("x-ui", color: .gray.opacity(0.25)) }
-                Button { onText("88") } label: { keyButtonLabel("88", color: .gray.opacity(0.25)) }
-                Button { onKey(Data([0x1B, 0x5B, 0x41])) } label: { keyButtonLabel("↑", color: .gray.opacity(0.25)) }
-                Button { onKey(Data([0x1B, 0x5B, 0x42])) } label: { keyButtonLabel("↓", color: .gray.opacity(0.25)) }
-            }
-            .padding(.horizontal, 6).padding(.bottom, 4)
+            .padding(.horizontal, 8).padding(.bottom, 6)
         }
-        .background(Color(red: 0.1, green: 0.1, blue: 0.12))
+        .background(Color(red: 0.06, green: 0.09, blue: 0.15))
         .overlay(Rectangle().frame(height: 1).foregroundColor(Theme.stroke), alignment: .top)
     }
     
