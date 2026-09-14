@@ -11,17 +11,14 @@ import SwiftTerm
 
 typealias Color = SwiftUI.Color
 
-// MARK: - 字体：注册内置 Sarasa Mono SC（中英文等宽），查找时多重兜底
+// MARK: - 字体
 enum FontLoader {
     static func registerFonts() {
         guard let urls = Bundle.main.urls(forResourcesWithExtension: "ttf", subdirectory: nil) else { return }
-        for url in urls {
-            CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
-        }
+        for url in urls { CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil) }
     }
     static func monoFont(size: CGFloat) -> UIFont {
-        let names = ["SarasaMonoSC-Regular", "SarasaMonoSC", "Sarasa Mono SC"]
-        for n in names {
+        for n in ["SarasaMonoSC-Regular", "SarasaMonoSC", "Sarasa Mono SC"] {
             if let f = UIFont(name: n, size: size) { return f }
         }
         return UIFont.monospacedSystemFont(ofSize: size, weight: .regular)
@@ -50,7 +47,7 @@ struct CommandRecord: Identifiable {
     var output: String = ""
 }
 
-// MARK: - 着色
+// MARK: - 着色 + ANSI 剥离
 enum TerminalColorizer {
     static let reset = "\u{1B}[0m"
     static let red = "\u{1B}[31m"
@@ -62,6 +59,7 @@ enum TerminalColorizer {
     static let errorK = ["error","failed","fail","fatal","denied","refused","exception"]
     static let successK = ["success","ok","done","complete","finished","running"]
     static let warnK = ["warning","warn","deprecated"]
+
     static func colorize(_ text: String) -> String {
         if text.contains("\u{1B}[") { return text }
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
@@ -78,6 +76,32 @@ enum TerminalColorizer {
             out.append(c)
         }
         return out.joined(separator: "\n")
+    }
+
+    /// 剥离所有 ANSI 转义码、OSC 序列、控制字符
+    /// 复制用，终端显示不用这个
+    static func stripANSI(_ text: String) -> String {
+        var r = text
+        // CSI: ESC [ ... 最终字母
+        if let re = try? NSRegularExpression(pattern: "\u{1B}\\[[0-9;?]*[a-zA-Z]", options: []) {
+            let range = NSRange(r.startIndex..., in: r)
+            r = re.stringByReplacingMatches(in: r, options: [], range: range, withTemplate: "")
+        }
+        // OSC: ESC ] ... BEL 或 ESC \
+        if let re = try? NSRegularExpression(pattern: "\u{1B}\\][^\u{07}]*\u{07}", options: []) {
+            let range = NSRange(r.startIndex..., in: r)
+            r = re.stringByReplacingMatches(in: r, options: [], range: range, withTemplate: "")
+        }
+        if let re = try? NSRegularExpression(pattern: "\u{1B}\\][^\u{1B}]*\u{1B}\\\\", options: []) {
+            let range = NSRange(r.startIndex..., in: r)
+            r = re.stringByReplacingMatches(in: r, options: [], range: range, withTemplate: "")
+        }
+        // 单个控制字符：BEL, ESC, BS, 0x00-0x08, 0x0B-0x1F
+        r = r.replacingOccurrences(of: "\u{07}", with: "")
+        r = r.replacingOccurrences(of: "\u{1B}", with: "")
+        r = r.replacingOccurrences(of: "\u{08}", with: "")
+        r = r.replacingOccurrences(of: "\u{0D}", with: "")
+        return r
     }
 }
 
@@ -266,9 +290,12 @@ class SSHService: ObservableObject, Identifiable {
                             } else { self.isFiltering = false; self.onData?(d) }
                         } else {
                             if let s = String(data: d, encoding: .utf8) {
+                                // 👈 关键：历史里存的是剥掉 ANSI 的干净文本
+                                let clean = TerminalColorizer.stripANSI(s)
                                 if !self.commandHistory.isEmpty {
-                                    self.commandHistory[self.commandHistory.count - 1].output += s
+                                    self.commandHistory[self.commandHistory.count - 1].output += clean
                                 }
+                                // 终端显示仍用原始数据，保留颜色和光标控制
                                 let c = TerminalColorizer.colorize(s)
                                 self.onData?(Data(c.utf8))
                             } else { self.onData?(d) }
@@ -300,38 +327,20 @@ class SSHService: ObservableObject, Identifiable {
         }
     }
 
-    func appendInput(_ s: String) {
-        pendingInput += s
-        send(Data(s.utf8))
-    }
-
-    func backspace() {
-        if !pendingInput.isEmpty { pendingInput.removeLast() }
-        send(Data([0x7F]))
-    }
-
-    func cancelInput() {
-        pendingInput = ""
-        send(Data([0x03]))
-    }
-
+    func appendInput(_ s: String) { pendingInput += s; send(Data(s.utf8)) }
+    func backspace() { if !pendingInput.isEmpty { pendingInput.removeLast() }; send(Data([0x7F])) }
+    func cancelInput() { pendingInput = ""; send(Data([0x03])) }
     func commitInput() {
         let cmd = pendingInput.trimmingCharacters(in: .whitespaces)
-        if !cmd.isEmpty {
-            commandHistory.append(CommandRecord(command: cmd))
-        }
+        if !cmd.isEmpty { commandHistory.append(CommandRecord(command: cmd)) }
         pendingInput = ""
         send(Data([0x0D]))
     }
-
     func sendCommand(_ command: String) {
         commandHistory.append(CommandRecord(command: command))
         send(Data((command + "\n").utf8))
     }
-
-    func sendRawKey(_ code: UInt8) {
-        send(Data([code]))
-    }
+    func sendRawKey(_ code: UInt8) { send(Data([code])) }
 
     func resize(cols: Int, rows: Int) {
         guard let c = child else { return }
@@ -533,7 +542,6 @@ struct TerminalScreen: View {
         ZStack {
             Theme.bg.ignoresSafeArea()
             VStack(spacing: 0) {
-                // 顶部：返回 + 状态 + 收起键盘 + 复制
                 HStack {
                     Button { dismiss() } label: {
                         Image(systemName: "chevron.left").font(.system(size: 16, weight: .bold)).foregroundColor(Theme.blue).padding(8).background(Circle().fill(Theme.blueSoft))
@@ -552,7 +560,6 @@ struct TerminalScreen: View {
                     }
                 }.padding(.horizontal, 12).padding(.vertical, 10).background(Color.black.opacity(0.8))
 
-                // 快捷指令
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         Button { showShortcuts = true } label: {
@@ -569,13 +576,11 @@ struct TerminalScreen: View {
                 }.background(Color.black.opacity(0.5))
                 .sheet(isPresented: $showShortcuts) { ShortcutEditView().environmentObject(shortcutStore) }
 
-                // 终端
                 ZStack {
                     TerminalWrapper(ssh: ssh, bridge: bridge, keyboardMode: $keyboardMode).background(Theme.bg)
                     if keyboardMode == .hidden { Color.clear.contentShape(Rectangle()).onTapGesture { keyboardMode = .custom } }
                 }
 
-                // 键盘面板
                 if keyboardMode == .custom {
                     CustomKeyPanel(
                         onInput: { ssh.appendInput($0) },
@@ -618,7 +623,7 @@ struct TerminalScreen: View {
     }
 }
 
-// MARK: - 命令历史复制面板
+// MARK: - 命令历史
 struct CommandHistorySheet: View {
     let records: [CommandRecord]
     @Environment(\.dismiss) private var dismiss
