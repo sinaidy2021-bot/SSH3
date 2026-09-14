@@ -20,38 +20,44 @@ jobs:
           xcodegen generate
           echo "✅ 生成完毕"
 
-      - name: 构建模拟器版本
+      - name: 构建并打包未签名 IPA
         run: |
-          echo "👉 开始编译..."
+          echo "👉 开始编译真机版本..."
           
-          # 关闭 errexit，但不使用管道，直接重定向到日志文件，确保退出码能正确捕获
           set +e
-          xcodebuild \
+          # 编译真机架构，强制忽略代码签名
+          xcodebuild archive \
             -project SSHBlack.xcodeproj \
             -scheme SSHBlack \
             -configuration Release \
-            -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath build \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/SSHBlack.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
             -skipPackagePluginValidation \
-            -skipMacroValidation \
-            CODE_SIGNING_ALLOWED=NO > build_log.txt 2>&1
+            -skipMacroValidation > build_log.txt 2>&1
           EXIT_CODE=$?
           set -e
           
-          if [ $EXIT_CODE -eq 0 ]; then
-            echo "🎉 构建成功！"
-          else
+          if [ $EXIT_CODE -ne 0 ]; then
             echo "========================================"
-            echo "❌ 构建失败！以下是错误摘要及上下文："
+            echo "❌ 编译失败！以下是错误摘要："
             echo "========================================"
             grep -n -B 5 -A 5 "error:" build_log.txt | tail -n 100
-            echo "========================================"
-            echo "👉 请截图以上报错信息。"
             exit 1
           fi
 
-      - name: 上传产物
+          echo "✅ 编译成功，正在打包 Payload..."
+          mkdir -p build/Payload
+          cp -R build/SSHBlack.xcarchive/Products/Applications/SSHBlack.app build/Payload/
+          
+          cd build
+          zip -r SSHBlack-unsigned.ipa Payload
+          echo "🎉 未签名 IPA 打包完成！"
+
+      - name: 上传 IPA 产物
         uses: actions/upload-artifact@v4
         with:
-          name: SSHBlack-模拟器版
-          path: build/Build/Products/Release-iphonesimulator/SSHBlack.app
+          name: SSHBlack-未签名IPA
+          path: build/SSHBlack-unsigned.ipa
