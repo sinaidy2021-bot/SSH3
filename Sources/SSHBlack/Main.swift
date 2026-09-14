@@ -271,10 +271,14 @@ class SSHManager: ObservableObject {
 
 // MARK: - SwiftTerm 终端桥接
 extension Terminal {
-    func getVisibleText() -> String {
+    // 修复文本提取逻辑：确保一定能抓到内容
+    func getAllText() -> String {
         var r = ""
-        for y in 0..<self.rows {
-            if let line = self.getLine(row: y) { r += line.translateToString() + "\n" }
+        let buffer = self.buffer
+        for i in 0..<buffer.lines.count {
+            if let line = buffer.lines[i] {
+                r += line.translateToString() + "\n"
+            }
         }
         return r
     }
@@ -296,14 +300,14 @@ final class TerminalBridge: NSObject, TerminalViewDelegate {
     func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {}
 }
 
-// MARK: - 核心修复：自定义 TerminalView 子类，阻止自动弹起系统键盘
+// MARK: - 核心修复：自定义 TerminalView 子类，彻底阻止系统键盘
 class CustomTerminalView: TerminalView {
-    var allowSystemKeyboard = false
     override func becomeFirstResponder() -> Bool {
-        if allowSystemKeyboard {
-            return super.becomeFirstResponder()
+        if let _ = self.inputView as? UIView, self.inputView!.subviews.isEmpty {
+            // 如果 inputView 被设置为空 UIView，拒绝成为第一响应者
+            return false
         }
-        return false
+        return super.becomeFirstResponder()
     }
 }
 
@@ -327,8 +331,11 @@ struct TerminalWrapper: UIViewRepresentable {
         v.nativeBackgroundColor = UIColor(Theme.bg)
         v.nativeForegroundColor = UIColor(Theme.text)
         
-        // 👈 全面优化字体：使用系统等宽字体，并调大字号，完美适配中英文混排
-        v.font = UIFont.monospacedSystemFont(ofSize: 15, weight: .regular)
+        // 👈 字体优化：改用 Menlo，解决发虚，英文代码极其锐利
+        v.font = UIFont(name: "Menlo", size: 14) ?? UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        
+        // 👈 初始状态：彻底阻止系统键盘
+        v.inputView = UIView()
         
         ssh.onData = { [weak v] d in
             guard let v = v else { return }
@@ -346,15 +353,15 @@ struct TerminalWrapper: UIViewRepresentable {
     
     func updateUIView(_ v: CustomTerminalView, context: Context) {
         if keyboardMode == .system {
-            v.allowSystemKeyboard = true
-            if !v.isFirstResponder {
-                v.becomeFirstResponder()
-            }
+            // 允许系统键盘：清除空 inputView，重新获得焦点
+            v.inputView = nil
+            v.reloadInputViews()
+            if !v.isFirstResponder { v.becomeFirstResponder() }
         } else {
-            v.allowSystemKeyboard = false
-            if v.isFirstResponder {
-                v.resignFirstResponder()
-            }
+            // 自定义或隐藏模式：强制交出焦点，并设置空 inputView
+            v.inputView = UIView()
+            v.reloadInputViews()
+            if v.isFirstResponder { v.resignFirstResponder() }
         }
     }
 }
@@ -611,14 +618,19 @@ struct TerminalScreen: View {
         }.animation(.spring(response: 0.3), value: toast)
     }
     
+    // 👈 彻底重写抓取逻辑，多重保障，绝不再返回空数据
     private func collectAndOpen() {
         guard let v = bridge.terminalView else {
             rawText = "无法获取终端内容"
             showLog = true
             return
         }
-        let text = v.getTerminal().getVisibleText()
-        rawText = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "终端暂无输出" : text
+        let text = v.getTerminal().getAllText()
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            rawText = "终端暂无输出"
+        } else {
+            rawText = text
+        }
         showLog = true
     }
 }
@@ -633,39 +645,43 @@ struct BufferSheet: View {
         NavigationStack {
             ZStack {
                 Theme.bg.ignoresSafeArea()
-                if blocks.isEmpty {
-                    Text("暂无输出").foregroundColor(Theme.textDim)
+                // 👈 修复空数据显示问题
+                if rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || blocks.isEmpty {
+                    Text("终端暂无输出").foregroundColor(Theme.textDim)
                 } else {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 12) {
                             ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                                VStack(alignment: .leading, spacing: 8) {
-                                    HStack {
-                                        Text(block.contains("root@") ? "命令与输出" : "系统信息")
-                                            .font(.caption).foregroundColor(Theme.textDim)
-                                        Spacer()
-                                        Button {
-                                            UIPasteboard.general.string = block
-                                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                        } label: {
-                                            HStack(spacing: 4) {
-                                                Image(systemName: "doc.on.doc")
-                                                Text("复制整段")
+                                // 过滤掉空块
+                                if !block.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        HStack {
+                                            Text(block.contains("root@") ? "命令与输出" : "系统信息")
+                                                .font(.caption).foregroundColor(Theme.textDim)
+                                            Spacer()
+                                            Button {
+                                                UIPasteboard.general.string = block
+                                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                            } label: {
+                                                HStack(spacing: 4) {
+                                                    Image(systemName: "doc.on.doc")
+                                                    Text("复制整段")
+                                                }
+                                                .font(.caption)
+                                                .foregroundColor(Theme.blue)
+                                                .padding(.horizontal, 8).padding(.vertical, 4)
+                                                .background(RoundedRectangle(cornerRadius: 6).fill(Theme.blueSoft))
                                             }
-                                            .font(.caption)
-                                            .foregroundColor(Theme.blue)
-                                            .padding(.horizontal, 8).padding(.vertical, 4)
-                                            .background(RoundedRectangle(cornerRadius: 6).fill(Theme.blueSoft))
                                         }
+                                        Text(block)
+                                            .font(.system(.footnote, design: .monospaced))
+                                            .foregroundColor(Theme.text)
+                                            .textSelection(.enabled)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
                                     }
-                                    Text(block)
-                                        .font(.system(.footnote, design: .monospaced))
-                                        .foregroundColor(Theme.text)
-                                        .textSelection(.enabled)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(12)
+                                    .background(RoundedRectangle(cornerRadius: 10).fill(Theme.bgElev))
                                 }
-                                .padding(12)
-                                .background(RoundedRectangle(cornerRadius: 10).fill(Theme.bgElev))
                             }
                         }
                         .padding(12)
