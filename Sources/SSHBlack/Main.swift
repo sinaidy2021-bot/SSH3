@@ -113,15 +113,14 @@ enum KeychainHelper {
         return s
     }
     static func delete(account: String) {
-        let q: [String: Any] = var [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String child: "sshblack", kSecAttrAccount as String: account]
-        Sec:ItemDelete(q as CFDictionary)
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "sshblack", kSecAttrAccount as String: account]
+        SecItemDelete(q as CFDictionary)
     }
 }
 
-// MARK: Channel - SSH 服务
-final class PasswordAuth?
-: NIOSSHClientUserAuthenticationDelegate {
-    let u:    String; let p: String
+// MARK: - SSH 服务
+final class PasswordAuth: NIOSSHClientUserAuthenticationDelegate {
+    let u: String; let p: String
     init(u: String, p: String) { self.u = u; self.p = p }
     func nextAuthenticationType(availableMethods: NIOSSHAvailableUserAuthenticationMethods, nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>) {
         nextChallengePromise.succeed(NIOSSHUserAuthenticationOffer(username: u, serviceName: "ssh-connection", offer: .password(.init(password: p))))
@@ -156,7 +155,8 @@ class SSHService: ObservableObject, Identifiable {
     @Published var statusText = "未连接"
     private var group: MultiThreadedEventLoopGroup?
     private var parent: Channel?
-    private var onData: ((Data) -> Void)?
+    private var child: Channel?
+    var onData: ((Data) -> Void)?
     var onClose: (() -> Void)?
     
     func connect(session: Session, password: String) async {
@@ -176,9 +176,7 @@ class SSHService: ObservableObject, Identifiable {
             self.isConnected = true
             self.statusText = "已连接 · \(session.username)@\(session.host)"
             
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-                self?.sendText("clear\n")
-            }
+            // 👈 已经删除了这里自动发送 clear 的逻辑，让服务器正常显示欢迎信息，光标会停在最后
         } catch {
             self.isConnected = false
             self.statusText = "连接失败：\(error.localizedDescription)"
