@@ -159,7 +159,6 @@ class SSHService: ObservableObject, Identifiable {
     var onData: ((Data) -> Void)?
     var onClose: (() -> Void)?
     
-    // 客户端级数据流过滤，彻底解决“广告”问题
     private var initialBuffer = ""
     private var hasSeenLogin = false
     
@@ -179,8 +178,6 @@ class SSHService: ObservableObject, Identifiable {
             try await openShell(cols: 80, rows: 24)
             self.isConnected = true
             self.statusText = "已连接 · \(session.username)@\(session.host)"
-            
-            // 👈 已完全移除自动发送 clear 的逻辑，不再自动清屏，光标更不会乱跑。
         } catch {
             self.isConnected = false
             self.statusText = "连接失败：\(error.localizedDescription)"
@@ -198,13 +195,11 @@ class SSHService: ObservableObject, Identifiable {
                 onData: { [weak self] d in
                     Task { @MainActor in
                         guard let self = self else { return }
-                        // 👈 从根本上解决问题：过滤数据流，只放行从 "Last login:" 开始的内容
                         if self.hasSeenLogin {
                             self.onData?(d)
                         } else {
                             if let str = String(data: d, encoding: .utf8) {
                                 self.initialBuffer += str
-                                // 搜索 "Last login" 出现的位置
                                 if let range = self.initialBuffer.range(of: "Last login:") {
                                     self.hasSeenLogin = true
                                     let keep = self.initialBuffer[range.lowerBound...]
@@ -213,7 +208,6 @@ class SSHService: ObservableObject, Identifiable {
                                     }
                                     self.initialBuffer = ""
                                 } else if self.initialBuffer.count > 32768 {
-                                    // 如果缓冲区超过32KB还没找到，说明服务器根本没有 Last login，直接全量输出
                                     self.hasSeenLogin = true
                                     if let keepData = self.initialBuffer.data(using: .utf8) {
                                         self.onData?(keepData)
@@ -221,7 +215,6 @@ class SSHService: ObservableObject, Identifiable {
                                     self.initialBuffer = ""
                                 }
                             } else {
-                                // 解码失败，放弃过滤
                                 self.hasSeenLogin = true
                                 self.onData?(d)
                             }
@@ -333,7 +326,9 @@ struct TerminalWrapper: UIViewRepresentable {
         v.backgroundColor = UIColor(Theme.bg)
         v.nativeBackgroundColor = UIColor(Theme.bg)
         v.nativeForegroundColor = UIColor(Theme.text)
-        v.font = UIFont(name: "Menlo", size: 14) ?? UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        
+        // 👈 全面优化字体：使用系统等宽字体，并调大字号，完美适配中英文混排
+        v.font = UIFont.monospacedSystemFont(ofSize: 15, weight: .regular)
         
         ssh.onData = { [weak v] d in
             guard let v = v else { return }
@@ -616,23 +611,14 @@ struct TerminalScreen: View {
         }.animation(.spring(response: 0.3), value: toast)
     }
     
-    // 👈 修复点：多重保障抓取终端文本，确保复制功能绝对有效
     private func collectAndOpen() {
         guard let v = bridge.terminalView else {
             rawText = "无法获取终端内容"
             showLog = true
             return
         }
-        // 方案A：尝试读取可见文本
-        var text = v.getTerminal().getVisibleText()
-        
-        // 方案B：如果方案A失败，尝试直接读取终端缓冲区
-        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            // 如果 API 允许，使用 getBufferAsString 作为后备
-            text = "终端暂无输出"
-        }
-        
-        rawText = text
+        let text = v.getTerminal().getVisibleText()
+        rawText = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "终端暂无输出" : text
         showLog = true
     }
 }
@@ -705,7 +691,6 @@ struct BufferSheet: View {
         .preferredColorScheme(.dark)
     }
 
-    // 解析逻辑：提取“命令+输出”打包成块
     private func parseBlocks() {
         let lines = rawText.split(separator: "\n", omittingEmptySubsequences: false)
         var current = ""
@@ -722,11 +707,7 @@ struct BufferSheet: View {
             current += lineStr + "\n"
         }
         if !current.isEmpty { result.append(current) }
-        
-        // 兜底逻辑：如果解析失败，整个文本作为一块
-        if result.isEmpty {
-            result = [rawText]
-        }
+        if result.isEmpty { result = [rawText] }
         self.blocks = result.reversed()
     }
 }
