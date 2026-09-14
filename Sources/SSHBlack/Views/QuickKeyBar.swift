@@ -1,13 +1,12 @@
 import SwiftUI
 
-/// 底部快捷键条
 struct QuickKeyBar: View {
-    let onKey: (QuickKey) -> Void
+    let onKey: (TerminalKey) -> Void
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                ForEach(QuickKey.allCases, id: \.self) { key in
+                ForEach(TerminalKey.allCases, id: \.self) { key in
                     Button {
                         onKey(key)
                         UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -42,7 +41,7 @@ struct QuickKeyBar: View {
     }
 }
 
-enum QuickKey: CaseIterable {
+enum TerminalKey: CaseIterable {
     case esc, tab, ctrlC, ctrlD, ctrlL, ctrlZ
     case arrowUp, arrowDown, arrowLeft, arrowRight
     case pipe, tilde, slash, dash, star, dollar
