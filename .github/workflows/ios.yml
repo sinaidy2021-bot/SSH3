@@ -1,11 +1,11 @@
 name: iOS 构建
 
 on:
-  workflow_dispatch:  # 只有手动点按钮才会构建
+  workflow_dispatch:  # 只有你手动点按钮才会构建
 
 jobs:
   build:
-    runs-on: macos-15   # 使用 Xcode 16 环境
+    runs-on: macos-15
 
     steps:
       - name: 拉取代码
@@ -33,7 +33,7 @@ jobs:
             -project SSHBlack.xcodeproj \
             -scheme SSHBlack \
             -configuration Release \
-            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath build \
             -skipPackagePluginValidation \
             -skipMacroValidation \
@@ -45,9 +45,44 @@ jobs:
           if [ $EXIT_CODE -eq 0 ]; then
             echo "🎉 构建成功！"
           else
-            echo "❌ 构建失败！以下是中文错误摘要："
-            grep -i "error:" build_log.txt | tail -n 15
-            echo "👉 请截图以上错误信息。"
+            # 计算报错条数
+            ERROR_COUNT=$(grep -c "error:" build_log.txt)
+            echo "========================================"
+            echo "🔍 共发现 ${ERROR_COUNT} 条报错，逐条列出（含上下文和建议方案）"
+            echo "========================================"
+            echo ""
+            
+            # 逐条提取并排版报错
+            grep -n "error:" build_log.txt | while IFS= read -r line; do
+              LINE_NUM=$(echo "$line" | cut -d: -f1)
+              ERROR_MSG=$(echo "$line" | cut -d: -f2-)
+              
+              echo "----------------------------------------"
+              echo "📍 报错内容："
+              echo "$ERROR_MSG"
+              echo ""
+              echo "上下文（原始日志第 ${LINE_NUM} 行附近）："
+              START=$((LINE_NUM - 3))
+              END=$((LINE_NUM + 3))
+              sed -n "${START},${END}p" build_log.txt | sed 's/^/    /'
+              echo ""
+              echo "💡 建议：把这条报错完整内容发给我，我可以帮你定位具体是哪一行代码的问题。"
+              echo ""
+            done
+            
+            # 如果还有 BUILD FAILED 也提取出来
+            if grep -q "BUILD FAILED" build_log.txt; then
+              echo "----------------------------------------"
+              echo "📍 报错内容："
+              echo "** BUILD FAILED **"
+              echo ""
+              echo "上下文（原始日志末尾附近）："
+              tail -n 5 build_log.txt | sed 's/^/    /'
+              echo ""
+              echo "💡 建议：把这条报错完整内容发给我，我可以帮你定位具体是哪一行代码的问题。"
+              echo ""
+            fi
+            
             exit 1
           fi
 
