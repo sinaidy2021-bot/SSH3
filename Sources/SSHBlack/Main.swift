@@ -47,7 +47,7 @@ struct CommandRecord: Identifiable {
     var output: String = ""
 }
 
-// MARK: - 着色 + ANSI 剥离
+// MARK: - ANSI 处理
 enum TerminalColorizer {
     static let reset = "\u{1B}[0m"
     static let red = "\u{1B}[31m"
@@ -78,30 +78,32 @@ enum TerminalColorizer {
         return out.joined(separator: "\n")
     }
 
-    /// 剥离所有 ANSI 转义码、OSC 序列、控制字符
-    /// 复制用，终端显示不用这个
     static func stripANSI(_ text: String) -> String {
         var r = text
-        // CSI: ESC [ ... 最终字母
         if let re = try? NSRegularExpression(pattern: "\u{1B}\\[[0-9;?]*[a-zA-Z]", options: []) {
-            let range = NSRange(r.startIndex..., in: r)
-            r = re.stringByReplacingMatches(in: r, options: [], range: range, withTemplate: "")
+            r = re.stringByReplacingMatches(in: r, options: [], range: NSRange(r.startIndex..., in: r), withTemplate: "")
         }
-        // OSC: ESC ] ... BEL 或 ESC \
         if let re = try? NSRegularExpression(pattern: "\u{1B}\\][^\u{07}]*\u{07}", options: []) {
-            let range = NSRange(r.startIndex..., in: r)
-            r = re.stringByReplacingMatches(in: r, options: [], range: range, withTemplate: "")
+            r = re.stringByReplacingMatches(in: r, options: [], range: NSRange(r.startIndex..., in: r), withTemplate: "")
         }
         if let re = try? NSRegularExpression(pattern: "\u{1B}\\][^\u{1B}]*\u{1B}\\\\", options: []) {
-            let range = NSRange(r.startIndex..., in: r)
-            r = re.stringByReplacingMatches(in: r, options: [], range: range, withTemplate: "")
+            r = re.stringByReplacingMatches(in: r, options: [], range: NSRange(r.startIndex..., in: r), withTemplate: "")
         }
-        // 单个控制字符：BEL, ESC, BS, 0x00-0x08, 0x0B-0x1F
         r = r.replacingOccurrences(of: "\u{07}", with: "")
         r = r.replacingOccurrences(of: "\u{1B}", with: "")
         r = r.replacingOccurrences(of: "\u{08}", with: "")
-        r = r.replacingOccurrences(of: "\u{0D}", with: "")
         return r
+    }
+
+    /// 处理 \r：\r\n 当换行，单 \r 视为行内覆盖（取最后一段）
+    static func normalizeCR(_ text: String) -> String {
+        let r = text.replacingOccurrences(of: "\r\n", with: "\n")
+        let lines = r.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let normalized = lines.map { line -> String in
+            let parts = line.split(separator: "\r", omittingEmptySubsequences: false).map(String.init)
+            return parts.last ?? ""
+        }
+        return normalized.joined(separator: "\n")
     }
 }
 
@@ -159,7 +161,7 @@ enum KeychainHelper {
         a[kSecValueData as String] = Data(v.utf8); a[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
         SecItemAdd(a as CFDictionary, nil)
     }
-    static func read(account: String) -> String? {
+    static func read(account: String), hostKeyChanged -> String? {
         let q: [String:Any] = [kSecClass as String:kSecClassGenericPassword,kSecAttrService as String:service,kSecAttrAccount as String:account,kSecReturnData as String:true,kSecMatchLimit as String:kSecMatchLimitOne]
         var i: AnyObject?; guard SecItemCopyMatching(q as CFDictionary, &i) == errSecSuccess, let d = i as? Data else { return nil }
         return String(data: d, encoding: .utf8)
@@ -172,7 +174,7 @@ enum KeychainHelper {
 
 // MARK: - SSH 认证
 enum SSHClientError: Error, LocalizedError {
-    case notConnected, hostKeyChanged(String)
+    case notConnected(String)
     var errorDescription: String? {
         switch self { case .notConnected: return "未连接"; case .hostKeyChanged(let f): return "⚠️ 主机密钥变更：\(f)" }
     }
@@ -211,7 +213,8 @@ final class DataHandler: ChannelInboundHandler {
 // MARK: - SSH 服务
 @MainActor
 class SSHService: ObservableObject, Identifiable {
-    let id = UUID()
+    }
+ let id = UUID()
     @Published var isConnected = false
     @Published var statusText = "未连接"
     @Published var commandHistory: [CommandRecord] = []
@@ -226,14 +229,19 @@ class SSHService: ObservableObject, Identifiable {
     private var isFiltering = false
     private var timeoutWork: DispatchWorkItem?
     private var pendingInput = ""
+    /// 是否在捕捉命令输出（按回车后为 true，开始新命令前为 false）
+    private var isCapturingOutput = false
+    /// 缓存已出现过的提示符行，用于快速去重
+    private var seenPrompts: Set<String> = []
 
     func connect(session: Session, password: String) async {
         await disconnect()
         statusText = "正在连接…"
         isFiltering = true; initialBuffer = ""; commandHistory.removeAll(); pendingInput = ""
+        isCapturingOutput = false; seenPrompts.removeAll()
         do {
-            let g = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-            let keyDel = TOFUHostKeyDelegate(host: session.host, port: session.port)
+                       let g = MultiThreadedEventLoopGroup(numberOfThreads: 1 self)
+            let keyDel = TOFUHostKeyDelegate(host: session.time.host, port: session.port)
             let bs = ClientBootstrap(group: g).channelInitializer { ch in
                 ch.pipeline.addHandler(NIOSSHHandler(
                     role: .client(.init(userAuthDelegate: PasswordAuth(u: session.username, p: password), serverAuthDelegate: keyDel)),
@@ -255,8 +263,7 @@ class SSHService: ObservableObject, Identifiable {
                         self.initialBuffer = ""
                     }
                 }
-            }
-            self.timeoutWork = work
+           outWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
         } catch {
             self.isConnected = false
@@ -290,12 +297,28 @@ class SSHService: ObservableObject, Identifiable {
                             } else { self.isFiltering = false; self.onData?(d) }
                         } else {
                             if let s = String(data: d, encoding: .utf8) {
-                                // 👈 关键：历史里存的是剥掉 ANSI 的干净文本
-                                let clean = TerminalColorizer.stripANSI(s)
-                                if !self.commandHistory.isEmpty {
-                                    self.commandHistory[self.commandHistory.count - 1].output += clean
+                                // 只有"捕捉输出"模式且已有记录，才累积到历史
+                                if self.isCapturingOutput && !self.commandHistory.isEmpty {
+                                    let idx = self.commandHistory.count - 1
+                                    let clean = TerminalColorizer.normalizeCR(TerminalColorizer.stripANSI(s))
+                                    let lines = clean.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+                                    var toAppend: [String] = []
+                                    for line in lines {
+                                        let trimmed = line.trimmingCharacters(in: .whitespaces)
+                                        // 跳过命令回显
+                                        if trimmed == self.commandHistory[idx].command { continue }
+                                        // 提示符行去重（用 Set，O(1) 查询，不会卡）
+                                        if trimmed.contains("root@") && (trimmed.contains("#") || trimmed.contains("$")) {
+                                            if self.seenPrompts.contains(trimmed) { continue }
+                                            self.seenPrompts.insert(trimmed)
+                                        }
+                                        toAppend.append(line)
+                                    }
+                                    if !toAppend.isEmpty {
+                                        let text = toAppend.joined(separator: "\n")
+                                        self.commandHistory[idx].output += text
+                                    }
                                 }
-                                // 终端显示仍用原始数据，保留颜色和光标控制
                                 let c = TerminalColorizer.colorize(s)
                                 self.onData?(Data(c.utf8))
                             } else { self.onData?(d) }
@@ -327,19 +350,43 @@ class SSHService: ObservableObject, Identifiable {
         }
     }
 
-    func appendInput(_ s: String) { pendingInput += s; send(Data(s.utf8)) }
-    func backspace() { if !pendingInput.isEmpty { pendingInput.removeLast() }; send(Data([0x7F])) }
-    func cancelInput() { pendingInput = ""; send(Data([0x03])) }
+    /// 敲键盘：字符累积到 pendingInput，不发到服务器（服务器会回显）
+    func appendInput(_ s: String) {
+        pendingInput += s
+        send(Data(s.utf8))
+    }
+
+    func backspace() {
+        if !pendingInput.isEmpty { pendingInput.removeLast() }
+        send(Data([0x7F]))
+    }
+
+    func cancelInput() {
+        pendingInput = ""
+        isCapturingOutput = false
+        send(Data([0x03]))
+    }
+
+    /// 按回车：提交命令，开始捕捉输出
     func commitInput() {
         let cmd = pendingInput.trimmingCharacters(in: .whitespaces)
-        if !cmd.isEmpty { commandHistory.append(CommandRecord(command: cmd)) }
+        if !cmd.isEmpty {
+            commandHistory.append(CommandRecord(command: cmd))
+            seenPrompts.removeAll()
+            isCapturingOutput = true
+        }
         pendingInput = ""
         send(Data([0x0D]))
     }
+
+    /// 快捷指令：直接发送
     func sendCommand(_ command: String) {
         commandHistory.append(CommandRecord(command: command))
+        seenPrompts.removeAll()
+        isCapturingOutput = true
         send(Data((command + "\n").utf8))
     }
+
     func sendRawKey(_ code: UInt8) { send(Data([code])) }
 
     func resize(cols: Int, rows: Int) {
@@ -354,6 +401,7 @@ class SSHService: ObservableObject, Identifiable {
         if let p = parent { try? await p.close().get() }
         if let g = group { try? await g.shutdownGracefully() }
         child = nil; parent = nil; group = nil; isConnected = false; statusText = "未连接"; pendingInput = ""
+        isCapturingOutput = false; seenPrompts.removeAll()
     }
 }
 
@@ -390,17 +438,28 @@ final class TerminalBridge: NSObject, TerminalViewDelegate {
     func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {}
 }
 
-// MARK: - 键盘三态
+// MARK: - 键盘三态（简化版）
 enum KeyboardMode { case custom, system, hidden }
+
 class CustomTerminalView: TerminalView {
-    var allowSystemKeyboard: Bool = false
-    override var canBecomeFirstResponder: Bool { return allowSystemKeyboard }
-    override func becomeFirstResponder() -> Bool {
-        let r = super.becomeFirstResponder()
-        if r { self.inputAccessoryView = nil; self.inputView = self.allowSystemKeyboard ? nil : UIView(); self.reloadInputViews() }
-        return r
+    /// true: 允许系统键盘；false: 用空白 inputView 屏蔽系统键盘
+    var allowSystemKeyboard: Bool = false {
+        didSet {
+            guard oldValue != allowSystemKeyboard else { return }
+            if allowSystemKeyboard {
+                self.inputView = nil
+                self.inputAccessoryView = nil
+                self.reloadInputViews()
+            } else {
+                self.inputView = UIView()
+                self.inputAccessoryView = nil
+                self.reloadInputViews()
+                if self.isFirstResponder { self.resignFirstResponder() }
+            }
+        }
     }
 }
+
 struct TerminalWrapper: UIViewRepresentable {
     @ObservedObject var ssh: SSHService
     let bridge: TerminalBridge
@@ -423,8 +482,12 @@ struct TerminalWrapper: UIViewRepresentable {
         let want = (keyboardMode == .system)
         if v.allowSystemKeyboard != want {
             v.allowSystemKeyboard = want
-            if want { v.inputView = nil; v.inputAccessoryView = nil; v.reloadInputViews(); if !v.isFirstResponder { _ = v.becomeFirstResponder() } }
-            else { if v.isFirstResponder { v.resignFirstResponder() }; v.inputView = UIView(); v.inputAccessoryView = nil; v.reloadInputViews() }
+            if want {
+                // 切换到系统键盘：延迟一帧 becomeFirstResponder，避免在 updateUIView 里触发循环
+                DispatchQueue.main.async {
+                    if !v.isFirstResponder { _ = v.becomeFirstResponder() }
+                }
+            }
         }
     }
 }
@@ -593,12 +656,18 @@ struct TerminalScreen: View {
                         onHide: { keyboardMode = .hidden },
                         onSwitchToSystem: { keyboardMode = .system }
                     )
-                } else if keyboardMode == .hidden {
+                } else {
+                    // .system 和 .hidden 都显示微缩工具条
                     HStack {
                         Button { keyboardMode = .custom } label: {
                             HStack(spacing: 4) { Image(systemName: "keyboard"); Text("微缩键盘") }
                                 .font(.system(size: 13, weight: .medium)).foregroundColor(Theme.blue)
                                 .padding(.horizontal, 12).padding(.vertical, 8).background(RoundedRectangle(cornerRadius: 8).fill(Theme.blueSoft))
+                        }
+                        Button { keyboardMode = .hidden } label: {
+                            HStack(spacing: 4) { Image(systemName: "keyboard.chevron.compact.down"); Text("收起") }
+                                .font(.system(size: 13, weight: .medium)).foregroundColor(Theme.orange)
+                                .padding(.horizontal, 12).padding(.vertical, 8).background(RoundedRectangle(cornerRadius: 8).fill(Theme.orange.opacity(0.2)))
                         }
                         Spacer()
                         Text("已在线").font(.caption).foregroundColor(Theme.textDim)
@@ -616,9 +685,6 @@ struct TerminalScreen: View {
         .task {
             let pw = KeychainHelper.read(account: "session.\(session.id.uuidString).password") ?? ""
             if !ssh.isConnected { await ssh.connect(session: session, password: pw) }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
-            if keyboardMode == .system { keyboardMode = .custom }
         }
     }
 }
