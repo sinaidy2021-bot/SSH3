@@ -7,10 +7,9 @@ import NIOPosix
 import NIOSSH
 import SwiftTerm
 
-// 解决 SwiftUI.Color 和 SwiftTerm 的冲突
 typealias Color = SwiftUI.Color
 
-// MARK: - 主题 UI
+// MARK: - 主题
 enum Theme {
     static let neon = Color(red: 0.00, green: 0.93, blue: 0.62)
     static let neonSoft = Color(red: 0.00, green: 0.93, blue: 0.62).opacity(0.15)
@@ -101,7 +100,7 @@ enum KeychainHelper {
     }
 }
 
-// MARK: - SSH 认证和处理器
+// MARK: - SSH 认证与处理器
 final class PasswordAuthDelegate: NIOSSHClientUserAuthenticationDelegate {
     private let username: String
     private let password: String
@@ -124,7 +123,6 @@ final class InteractiveHandler: ChannelInboundHandler {
     init(onData: @escaping (Data) -> Void, onClose: @escaping () -> Void) { self.onData = onData; self.onClose = onClose }
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let channelData = unwrapInboundIn(data)
-        // 兼容旧版本的 NIO API，直接读取底层 data
         if case .byteBuffer(var buffer) = channelData.data {
             if let bytes = buffer.readBytes(length: buffer.readableBytes) {
                 onData(Data(bytes))
@@ -286,10 +284,10 @@ struct QuickKeyBar: View {
                 ForEach(TerminalKey.allCases, id: \.self) { key in
                     Button {
                         onKey(key)
-                        UIImpactFeedbackGenerator (style: .light).impactOccurred12()
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     } label: {
-                       ). Text(key.label).font(.system(.footpaddingnote, design: .monospaced).(.weight(.medium))
-                            .foregroundColor(Themevertical.neon).padding(.horizontal, 12).padding(.vertical, 8)
+                        Text(key.label).font(.system(.footnote, design: .monospaced).weight(.medium))
+                            .foregroundColor(Theme.neon).padding(.horizontal, 12).padding(.vertical, 8)
                             .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Theme.neonSoft).overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Theme.neon.opacity(0.35), lineWidth: 1)))
                     }.buttonStyle(.plain)
                 }
@@ -318,7 +316,7 @@ enum TerminalKey: CaseIterable {
     }
 }
 
-// MARK: - 主界面
+// MARK: - 界面
 struct RootView: View {
     var body: some View { NavigationStack { SessionListView() }.tint(Theme.neon) }
 }
@@ -433,7 +431,7 @@ struct SessionEditView: View {
             Image(systemName: icon).font(.system(size: 14, weight: .semibold)).foregroundColor(Theme.neon).frame(width: 22)
             Text(title).font(.system(.subheadline, design: .rounded)).foregroundColor(Theme.textDim).frame(width: 52, alignment: .leading)
             content().foregroundColor(Theme.text)
-        }.padding(.horizontal,, 12)
+        }.padding(.horizontal, 12).padding(.vertical, 12)
     }
     private var divider: some View { Rectangle().frame(height: 1).foregroundColor(Theme.stroke).padding(.leading, 44) }
     private func saveAndClose() { if session.name.isEmpty { session.name = session.host }; store.upsert(session); store.setPassword(password, for: session); dismiss() }
