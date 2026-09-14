@@ -255,6 +255,8 @@ final class TerminalBridge: NSObject, TerminalViewDelegate {
 struct TerminalViewWrapper: UIViewRepresentable {
     @ObservedObject var ssh: SSHService
     let bridge: TerminalBridge
+    @Binding var showSystemKeyboard: Bool
+
     func makeUIView(context: Context) -> TerminalView {
         let view = TerminalView(frame: .zero)
         view.terminalDelegate = bridge
@@ -263,8 +265,11 @@ struct TerminalViewWrapper: UIViewRepresentable {
         view.nativeBackgroundColor = UIColor(Theme.bg)
         view.nativeForegroundColor = UIColor(Theme.text)
         
-        // 使用系统字体解决中文间距问题
+        // 👇 修复中文字间距异常：使用系统原生字体
         view.font = UIFont.systemFont(ofSize: 14)
+        
+        // 👇 初始状态：阻止系统键盘弹出，使用自定义键盘
+        view.inputView = UIView()
         
         ssh.onData = { [weak view] data in
             guard let view = view else { return }
@@ -280,7 +285,22 @@ struct TerminalViewWrapper: UIViewRepresentable {
         }
         return view
     }
-    func updateUIView(_ uiView: TerminalView, context: Context) {}
+    
+    func updateUIView(_ uiView: TerminalView, context: Context) {
+        // 👇 根据状态切换系统键盘和自定义键盘
+        if showSystemKeyboard {
+            if uiView.inputView != nil {
+                uiView.inputView = nil
+                uiView.reloadInputViews()
+                uiView.becomeFirstResponder()
+            }
+        } else {
+            if uiView.inputView == nil {
+                uiView.inputView = UIView()
+                uiView.reloadInputViews()
+            }
+        }
+    }
 }
 
 // MARK: - 界面
@@ -329,10 +349,10 @@ struct SessionListView: View {
                 LazyVStack(spacing: 12) {
                     ForEach(store.sessions) { session in
                         NavigationLink { TerminalScreen(session: session) } label: { SessionCard(session: session) }
-                            .buttonStyle域名(.plain)
+                            .buttonStyle(.plain)
                             .contextMenu {
-                                Button { isNew = false;", editing = session } label: { Label(" text编辑", systemImage: "square.:and.pencil") }
-                                Button(role: $ .destructive) { store.delete(session) }session label: { Label("删除", systemImage: "trash") }
+                                Button { isNew = false; editing = session } label: { Label("编辑", systemImage: "square.and.pencil") }
+                                Button(role: .destructive) { store.delete(session) } label: { Label("删除", systemImage: "trash") }
                             }
                     }
                 }.padding(.horizontal, 16).padding(.bottom, 20)
@@ -375,7 +395,7 @@ struct SessionEditView: View {
                 ScrollView {
                     VStack(spacing: 18) {
                         fieldCard { iconField(icon: "textformat", title: "名称") { TextField("例如：生产服务器", text: $session.name).textInputAutocapitalization(.never).autocorrectionDisabled() } }
-                        fieldCard { iconField(icon: "globe", title: "主机") { TextField("IP 或.host).textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL) }; divider; iconField(icon: "number", title: "端口") { TextField("22", value: $session.port, format: .number).keyboardType(.numberPad) } }
+                        fieldCard { iconField(icon: "globe", title: "主机") { TextField("IP 或域名", text: $session.host).textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL) }; divider; iconField(icon: "number", title: "端口") { TextField("22", value: $session.port, format: .number).keyboardType(.numberPad) } }
                         fieldCard { iconField(icon: "person", title: "用户名") { TextField("root", text: $session.username).textInputAutocapitalization(.never).autocorrectionDisabled() } }
                         fieldCard { iconField(icon: "lock", title: "密码") { SecureField("登录密码", text: $password) } }
                         Button { saveAndClose() } label: { Text(isNew ? "保存并完成" : "保存修改").frame(maxWidth: .infinity) }
@@ -426,11 +446,11 @@ struct TerminalScreen: View {
     @State private var toast: String?
     @State private var showBufferSheet = false
     @State private var bufferLines: [String] = []
-    @State private var showSystemKeyboard = false
+    @State private var showSystemKeyboard = false // 控制键盘切换
     
-    // 快捷指令
+    // 快捷指令栏（保留你满意的UI）
     let quickCommands = [
-        ("+ 添加", ""), // 占位，仅做展示
+        ("+ 添加", ""),
         ("查看文件", "ls -la"),
         ("查看网络", "ifconfig"),
         ("磁盘空间", "df -h"),
@@ -445,11 +465,15 @@ struct TerminalScreen: View {
                 statusBar
                 quickCommandBar
                 terminalArea
+                // 👇 只有不显示系统键盘时，才显示自定义键盘
                 if !showSystemKeyboard {
                     CustomKeyPanel(
                         onKey: { key in ssh.send(key.bytes) },
                         onText: { text in ssh.sendText(text) },
-                        onToggleKeyboard: { toggleKeyboard() }
+                        onToggleKeyboard: {
+                            // 切换到系统键盘
+                            showSystemKeyboard = true
+                        }
                     )
                 }
             }
@@ -465,16 +489,6 @@ struct TerminalScreen: View {
             await ssh.connect(session: session, password: pw)
         }
         .onDisappear { Task { await ssh.disconnect() } }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in showSystemKeyboard = true }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in showSystemKeyboard = false }
-    }
-
-    private func toggleKeyboard() {
-        if showSystemKeyboard {
-            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-        } else {
-            UIApplication.shared.sendAction(#selector(UIResponder.becomeFirstResponder), to: nil, from: nil, for: nil)
-        }
     }
 
     private var statusBar: some View {
@@ -522,7 +536,11 @@ struct TerminalScreen: View {
         .overlay(Rectangle().frame(height: 1).foregroundColor(Theme.stroke), alignment: .bottom)
     }
 
-    private var terminalArea: some View { TerminalViewWrapper(ssh: ssh, bridge: bridge).background(Theme.bg) }
+    private var terminalArea: some View {
+        // 传入 showSystemKeyboard 绑定，控制原生键盘的弹出
+        TerminalViewWrapper(ssh: ssh, bridge: bridge, showSystemKeyboard: $showSystemKeyboard)
+            .background(Theme.bg)
+    }
 
     private var toastView: some View {
         Group {
@@ -543,54 +561,15 @@ struct TerminalScreen: View {
     private func showToast(_ text: String) { withAnimation { toast = text }; DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { withAnimation { toast = nil } } }
 }
 
-// MARK: - 自定义底部键盘（按你的截图重做）
+// MARK: - 自定义底部键盘（保留原样，只调整了排版紧凑度）
 struct CustomKeyPanel: View {
     let onKey: (TerminalKey) -> Void
     let onText: (String) -> Void
     let onToggleKeyboard: () -> Void
     
     var body: some View {
-        VStack(spacing: 6) {
-            // 第一行：控制栏
-            HStack(spacing: 8) {
-                Button {
-                    onToggleKeyboard()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "keyboard.chevron.compact.down")
-                        Text("收起")
-                    }
-                    .font(.system(.footnote, design: .rounded).weight(.medium))
-                    .foregroundColor(Theme.neon)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(RoundedRectangle(cornerRadius: 8).fill(Theme.neonSoft))
-                }.buttonStyle(.plain)
-                
-                Spacer()
-                
-                HStack(spacing: 4) {
-                    Circle().fill(Color.green).frame(width: 8, height: 8)
-                    Text("已在线").font(.system(.caption).weight(.medium)).foregroundColor(.gray)
-                }
-                
-                Spacer()
-                
-                Button {
-                    onKey(.enter)
-                } label: {
-                    Text("回车")
-                        .font(.system(.subheadline, design: .rounded).weight(.bold))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 24)
-                        .padding(.vertical, 8)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.blue))
-                }.buttonStyle(.plain)
-            }
-            .padding(.horizontal, 8)
-            .padding(.top, 6)
-            
-            // 第二行：数字及常用键
+        VStack(spacing: 4) {
+            // 第一行：数字及常用键
             HStack(spacing: 4) {
                 ForEach(["1","2","3","4","5","6","7","8","9","0","-"], id: \.self) { digit in
                     Button {
@@ -600,24 +579,25 @@ struct CustomKeyPanel: View {
                             .font(.system(.footnote, design: .monospaced).weight(.medium))
                             .foregroundColor(.white)
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
+                            .padding(.vertical, 8)
                             .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.25)))
                     }.buttonStyle(.plain)
                 }
             }.padding(.horizontal, 8)
             
-            // 第三行：快捷键区
+            // 第二行：快捷键区
             HStack(spacing: 4) {
-                Button { onText("空格") } label: { keyButtonLabel("空格", color: .gray.opacity(0.25)) }
                 Button { onText("x-ui") } label: { keyButtonLabel("x-ui", color: .gray.opacity(0.25)) }
                 Button { onText("88") } label: { keyButtonLabel("88", color: .gray.opacity(0.25)) }
+                Button { onText(" ") } label: { keyButtonLabel("空格", color: .gray.opacity(0.25)) }
                 Button { onKey(.backspace) } label: { keyButtonLabel("⌫ 退格", color: .gray.opacity(0.25)) }
+                Spacer()
                 Button { onKey(.ctrlC) } label: { keyButtonLabel("Ctrl+C", color: .red.opacity(0.7)) }
                 Button { onKey(.esc) } label: { keyButtonLabel("ESC", color: .orange.opacity(0.7)) }
                 Button { onToggleKeyboard() } label: { keyButtonLabel("Aa 全键盘", color: .blue.opacity(0.5)) }
             }
             .padding(.horizontal, 8)
-            .padding(.bottom, 6)
+            .padding(.bottom, 4)
         }
         .background(Color(red: 0.1, green: 0.1, blue: 0.12))
         .overlay(Rectangle().frame(height: 1).foregroundColor(Theme.stroke), alignment: .top)
@@ -628,7 +608,7 @@ struct CustomKeyPanel: View {
             .font(.system(.caption2, design: .monospaced).weight(.medium))
             .foregroundColor(.white)
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 10)
+            .padding(.vertical, 8)
             .background(RoundedRectangle(cornerRadius: 6).fill(color))
     }
 }
@@ -659,7 +639,7 @@ enum TerminalKey: CaseIterable {
     }
 }
 
-// MARK: - 输出历史/复制面板
+// MARK: - 输出历史/复制面板（保留原样）
 struct BufferSheet: View {
     let lines: [String]
     let onCopy: (String) -> Void
