@@ -9,13 +9,13 @@ options:
 packages:
   swift-nio:
     url: https://github.com/apple/swift-nio.git
-    exact: "2.65.0"
+    from: "2.65.0"
   swift-nio-ssh:
     url: https://github.com/apple/swift-nio-ssh.git
-    exact: "0.15.0"
+    from: "0.15.0"
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm.git
-    exact: "1.2.0"   # 👈 关键修复：锁死这个版本，避开 Xcode 16 的插件报错
+    exactVersion: "1.2.0"   # 👈 修复：必须用 exactVersion，不能用 exact
 
 targets:
   SSHBlack:
