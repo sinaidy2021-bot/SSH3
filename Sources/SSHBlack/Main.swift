@@ -11,7 +11,6 @@ import SwiftTerm
 
 typealias Color = SwiftUI.Color
 
-// MARK: - 字体
 enum FontLoader {
     static func registerFonts() {
         guard let urls = Bundle.main.urls(forResourcesWithExtension: "ttf", subdirectory: nil) else { return }
@@ -25,7 +24,6 @@ enum FontLoader {
     }
 }
 
-// MARK: - 主题
 enum Theme {
     static let blue = Color(red: 0.00, green: 0.48, blue: 1.00)
     static let blueSoft = Color(red: 0.00, green: 0.48, blue: 1.00).opacity(0.15)
@@ -40,14 +38,12 @@ enum Theme {
     static let green = Color(red: 0.20, green: 0.85, blue: 0.40)
 }
 
-// MARK: - 命令历史
 struct CommandRecord: Identifiable {
     let id = UUID()
     var command: String
     var output: String = ""
 }
 
-// MARK: - ANSI 处理
 enum TerminalColorizer {
     static let reset = "\u{1B}[0m"
     static let red = "\u{1B}[31m"
@@ -95,25 +91,29 @@ enum TerminalColorizer {
         return r
     }
 
-    /// 处理 \r：\r\n 当换行，单 \r 视为行内覆盖（取最后一段）
     static func normalizeCR(_ text: String) -> String {
         let r = text.replacingOccurrences(of: "\r\n", with: "\n")
         let lines = r.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        let normalized = lines.map { line -> String in
+        return lines.map { line -> String in
             let parts = line.split(separator: "\r", omittingEmptySubsequences: false).map(String.init)
             return parts.last ?? ""
-        }
-        return normalized.joined(separator: "\n")
+        }.joined(separator: "\n")
+    }
+
+    static func isEmptyPrompt(_ line: String) -> Bool {
+        let pattern = #"^[a-zA-Z0-9_\-\.]+@[a-zA-Z0-9_\-\.]+:[^\s]*[#$]\s*$"#
+        return line.range(of: pattern, options: .regularExpression) != nil
     }
 }
 
-// MARK: - 快捷指令
 struct Shortcut: Identifiable, Codable, Equatable {
     var id = UUID()
     var name: String
     var command: String
 }
-@MainActor class ShortcutStore: ObservableObject {
+
+@MainActor
+class ShortcutStore: ObservableObject {
     @Published var shortcuts: [Shortcut] = []
     private let key = "sshblack.shortcuts.v1"
     init() { load() }
@@ -129,7 +129,6 @@ struct Shortcut: Identifiable, Codable, Equatable {
     func delete(_ s: Shortcut) { shortcuts.removeAll { $0.id == s.id }; save() }
 }
 
-// MARK: - 会话
 struct Session: Identifiable, Codable {
     var id = UUID()
     var name: String
@@ -139,6 +138,7 @@ struct Session: Identifiable, Codable {
     var shortName: String { name.isEmpty ? host : name }
     var displayHost: String { "\(username)@\(host):\(port)" }
 }
+
 class SessionStore: ObservableObject {
     @Published var sessions: [Session] = []
     private let key = "sshblack.sessions.v1"
@@ -151,7 +151,6 @@ class SessionStore: ObservableObject {
     func setPassword(_ p: String, for s: Session) { KeychainHelper.save(p, account: "session.\(s.id.uuidString).password") }
 }
 
-// MARK: - Keychain
 enum KeychainHelper {
     private static let service = "com.example.sshblack"
     static func save(_ v: String, account: String) {
@@ -161,9 +160,10 @@ enum KeychainHelper {
         a[kSecValueData as String] = Data(v.utf8); a[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
         SecItemAdd(a as CFDictionary, nil)
     }
-    static func read(account: String), hostKeyChanged -> String? {
+    static func read(account: String) -> String? {
         let q: [String:Any] = [kSecClass as String:kSecClassGenericPassword,kSecAttrService as String:service,kSecAttrAccount as String:account,kSecReturnData as String:true,kSecMatchLimit as String:kSecMatchLimitOne]
-        var i: AnyObject?; guard SecItemCopyMatching(q as CFDictionary, &i) == errSecSuccess, let d = i as? Data else { return nil }
+        var i: AnyObject?
+        guard SecItemCopyMatching(q as CFDictionary, &i) == errSecSuccess, let d = i as? Data else { return nil }
         return String(data: d, encoding: .utf8)
     }
     static func delete(account: String) {
@@ -172,35 +172,48 @@ enum KeychainHelper {
     }
 }
 
-// MARK: - SSH 认证
 enum SSHClientError: Error, LocalizedError {
-    case notConnected(String)
+    case notConnected
+    case hostKeyChanged(String)
     var errorDescription: String? {
-        switch self { case .notConnected: return "未连接"; case .hostKeyChanged(let f): return "⚠️ 主机密钥变更：\(f)" }
+        switch self {
+        case .notConnected: return "未连接"
+        case .hostKeyChanged(let f): return "⚠️ 主机密钥变更：\(f)"
+        }
     }
 }
+
 final class PasswordAuth: NIOSSHClientUserAuthenticationDelegate {
-    let u: String; let p: String
+    let u: String
+    let p: String
     init(u: String, p: String) { self.u = u; self.p = p }
     func nextAuthenticationType(availableMethods: NIOSSHAvailableUserAuthenticationMethods, nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>) {
         nextChallengePromise.succeed(NIOSSHUserAuthenticationOffer(username: u, serviceName: "ssh-connection", offer: .password(.init(password: p))))
     }
 }
+
 final class TOFUHostKeyDelegate: NIOSSHClientServerAuthenticationDelegate {
-    let host: String; let port: Int
+    let host: String
+    let port: Int
     init(host: String, port: Int) { self.host = host; self.port = port }
     func validateHostKey(hostKey: NIOSSHPublicKey, validationCompletePromise: EventLoopPromise<Void>) {
         let desc = String(describing: hostKey)
         let fp = SHA256.hash(data: Data(desc.utf8)).compactMap { String(format: "%02x", $0) }.joined()
         let acct = "hostkey.\(host):\(port)"
         if let saved = KeychainHelper.read(account: acct) {
-            saved == fp ? validationCompletePromise.succeed(()) : validationCompletePromise.fail(SSHClientError.hostKeyChanged(fp))
-        } else { KeychainHelper.save(fp, account: acct); validationCompletePromise.succeed(()) }
+            if saved == fp { validationCompletePromise.succeed(()) }
+            else { validationCompletePromise.fail(SSHClientError.hostKeyChanged(fp)) }
+        } else {
+            KeychainHelper.save(fp, account: acct)
+            validationCompletePromise.succeed(())
+        }
     }
 }
+
 final class DataHandler: ChannelInboundHandler {
     typealias InboundIn = SSHChannelData
-    let onData: (Data) -> Void; let onClose: () -> Void
+    let onData: (Data) -> Void
+    let onClose: () -> Void
     init(onData: @escaping (Data) -> Void, onClose: @escaping () -> Void) { self.onData = onData; self.onClose = onClose }
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let d = unwrapInboundIn(data)
@@ -210,11 +223,9 @@ final class DataHandler: ChannelInboundHandler {
     func errorCaught(context: ChannelHandlerContext, error: Error) { onClose(); context.close(promise: nil) }
 }
 
-// MARK: - SSH 服务
 @MainActor
 class SSHService: ObservableObject, Identifiable {
-    }
- let id = UUID()
+    let id = UUID()
     @Published var isConnected = false
     @Published var statusText = "未连接"
     @Published var commandHistory: [CommandRecord] = []
@@ -229,30 +240,30 @@ class SSHService: ObservableObject, Identifiable {
     private var isFiltering = false
     private var timeoutWork: DispatchWorkItem?
     private var pendingInput = ""
-    /// 是否在捕捉命令输出（按回车后为 true，开始新命令前为 false）
     private var isCapturingOutput = false
-    /// 缓存已出现过的提示符行，用于快速去重
-    private var seenPrompts: Set<String> = []
 
     func connect(session: Session, password: String) async {
         await disconnect()
         statusText = "正在连接…"
-        isFiltering = true; initialBuffer = ""; commandHistory.removeAll(); pendingInput = ""
-        isCapturingOutput = false; seenPrompts.removeAll()
+        isFiltering = true
+        initialBuffer = ""
+        commandHistory.removeAll()
+        pendingInput = ""
+        isCapturingOutput = false
         do {
-                       let g = MultiThreadedEventLoopGroup(numberOfThreads: 1 self)
-            let keyDel = TOFUHostKeyDelegate(host: session.time.host, port: session.port)
+            let g = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+            let keyDel = TOFUHostKeyDelegate(host: session.host, port: session.port)
             let bs = ClientBootstrap(group: g).channelInitializer { ch in
                 ch.pipeline.addHandler(NIOSSHHandler(
                     role: .client(.init(userAuthDelegate: PasswordAuth(u: session.username, p: password), serverAuthDelegate: keyDel)),
                     allocator: ch.allocator, inboundChildChannelInitializer: nil))
             }
             let ch = try await bs.connect(host: session.host, port: session.port).get()
-            self.group = g; self.parent = ch
+            self.group = g
+            self.parent = ch
             try await openShell(cols: 80, rows: 24)
             self.isConnected = true
             self.statusText = "已连接 · \(session.username)@\(session.host)"
-
             let work = DispatchWorkItem { [weak self] in
                 Task { @MainActor in
                     guard let self = self, self.isFiltering else { return }
@@ -263,7 +274,8 @@ class SSHService: ObservableObject, Identifiable {
                         self.initialBuffer = ""
                     }
                 }
-           outWork = work
+            }
+            self.timeoutWork = work
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
         } catch {
             self.isConnected = false
@@ -294,10 +306,12 @@ class SSHService: ObservableObject, Identifiable {
                                     if let kd = c.data(using: .utf8) { self.onData?(kd) }
                                     self.initialBuffer = ""
                                 }
-                            } else { self.isFiltering = false; self.onData?(d) }
+                            } else {
+                                self.isFiltering = false
+                                self.onData?(d)
+                            }
                         } else {
                             if let s = String(data: d, encoding: .utf8) {
-                                // 只有"捕捉输出"模式且已有记录，才累积到历史
                                 if self.isCapturingOutput && !self.commandHistory.isEmpty {
                                     let idx = self.commandHistory.count - 1
                                     let clean = TerminalColorizer.normalizeCR(TerminalColorizer.stripANSI(s))
@@ -305,23 +319,22 @@ class SSHService: ObservableObject, Identifiable {
                                     var toAppend: [String] = []
                                     for line in lines {
                                         let trimmed = line.trimmingCharacters(in: .whitespaces)
-                                        // 跳过命令回显
                                         if trimmed == self.commandHistory[idx].command { continue }
-                                        // 提示符行去重（用 Set，O(1) 查询，不会卡）
-                                        if trimmed.contains("root@") && (trimmed.contains("#") || trimmed.contains("$")) {
-                                            if self.seenPrompts.contains(trimmed) { continue }
-                                            self.seenPrompts.insert(trimmed)
+                                        if TerminalColorizer.isEmptyPrompt(trimmed) {
+                                            self.isCapturingOutput = false
+                                            break
                                         }
                                         toAppend.append(line)
                                     }
                                     if !toAppend.isEmpty {
-                                        let text = toAppend.joined(separator: "\n")
-                                        self.commandHistory[idx].output += text
+                                        self.commandHistory[idx].output += toAppend.joined(separator: "\n")
                                     }
                                 }
                                 let c = TerminalColorizer.colorize(s)
                                 self.onData?(Data(c.utf8))
-                            } else { self.onData?(d) }
+                            } else {
+                                self.onData?(d)
+                            }
                         }
                     }
                 },
@@ -350,7 +363,6 @@ class SSHService: ObservableObject, Identifiable {
         }
     }
 
-    /// 敲键盘：字符累积到 pendingInput，不发到服务器（服务器会回显）
     func appendInput(_ s: String) {
         pendingInput += s
         send(Data(s.utf8))
@@ -367,22 +379,20 @@ class SSHService: ObservableObject, Identifiable {
         send(Data([0x03]))
     }
 
-    /// 按回车：提交命令，开始捕捉输出
     func commitInput() {
         let cmd = pendingInput.trimmingCharacters(in: .whitespaces)
         if !cmd.isEmpty {
             commandHistory.append(CommandRecord(command: cmd))
-            seenPrompts.removeAll()
             isCapturingOutput = true
+        } else {
+            isCapturingOutput = false
         }
         pendingInput = ""
         send(Data([0x0D]))
     }
 
-    /// 快捷指令：直接发送
     func sendCommand(_ command: String) {
         commandHistory.append(CommandRecord(command: command))
-        seenPrompts.removeAll()
         isCapturingOutput = true
         send(Data((command + "\n").utf8))
     }
@@ -396,36 +406,37 @@ class SSHService: ObservableObject, Identifiable {
     }
 
     func disconnect() async {
-        timeoutWork?.cancel(); timeoutWork = nil
+        timeoutWork?.cancel()
+        timeoutWork = nil
         if let c = child { try? await c.close().get() }
         if let p = parent { try? await p.close().get() }
         if let g = group { try? await g.shutdownGracefully() }
-        child = nil; parent = nil; group = nil; isConnected = false; statusText = "未连接"; pendingInput = ""
-        isCapturingOutput = false; seenPrompts.removeAll()
+        child = nil
+        parent = nil
+        group = nil
+        isConnected = false
+        statusText = "未连接"
+        pendingInput = ""
+        isCapturingOutput = false
     }
 }
 
-// MARK: - 全局管理
-@MainActor class SSHManager: ObservableObject {
+@MainActor
+class SSHManager: ObservableObject {
     static let shared = SSHManager()
     @Published var services: [UUID: SSHService] = [:]
     func service(for s: Session) -> SSHService {
         if let x = services[s.id] { return x }
-        let x = SSHService(); services[s.id] = x; return x
+        let x = SSHService()
+        services[s.id] = x
+        return x
     }
 }
 
-// MARK: - 终端桥接
-extension Terminal {
-    func getVisibleText() -> String {
-        var r = ""
-        for y in 0..<self.rows { if let l = self.getLine(row: y) { r += l.translateToString() + "\n" } }
-        return r
-    }
-}
 final class TerminalBridge: NSObject, TerminalViewDelegate {
     weak var terminalView: TerminalView?
-    var onInput: ((Data) -> Void)?; var onResize: ((Int, Int) -> Void)?
+    var onInput: ((Data) -> Void)?
+    var onResize: ((Int, Int) -> Void)?
     func send(source: TerminalView, data: ArraySlice<UInt8>) { onInput?(Data(data)) }
     func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) { onResize?(newCols, newRows) }
     func setTerminalTitle(source: TerminalView, title: String) {}
@@ -438,11 +449,9 @@ final class TerminalBridge: NSObject, TerminalViewDelegate {
     func requestOpenLink(source: TerminalView, link: String, params: [String: String]) {}
 }
 
-// MARK: - 键盘三态（简化版）
 enum KeyboardMode { case custom, system, hidden }
 
 class CustomTerminalView: TerminalView {
-    /// true: 允许系统键盘；false: 用空白 inputView 屏蔽系统键盘
     var allowSystemKeyboard: Bool = false {
         didSet {
             guard oldValue != allowSystemKeyboard else { return }
@@ -468,14 +477,23 @@ struct TerminalWrapper: UIViewRepresentable {
         let v = CustomTerminalView(frame: .zero)
         v.terminalDelegate = bridge
         bridge.terminalView = v
-        v.backgroundColor = UIColor(Theme.bg); v.nativeBackgroundColor = UIColor(Theme.bg); v.nativeForegroundColor = UIColor(Theme.text)
+        v.backgroundColor = UIColor(Theme.bg)
+        v.nativeBackgroundColor = UIColor(Theme.bg)
+        v.nativeForegroundColor = UIColor(Theme.text)
         v.font = FontLoader.monoFont(size: 15)
         v.allowSystemKeyboard = false
-        v.inputView = UIView(); v.inputAccessoryView = nil
-        ssh.onData = { [weak v] d in guard let v = v else { return }; DispatchQueue.main.async { v.feed(byteArray: [UInt8](d)[...]) } }
+        v.inputView = UIView()
+        v.inputAccessoryView = nil
+        ssh.onData = { [weak v] d in
+            guard let v = v else { return }
+            DispatchQueue.main.async { v.feed(byteArray: [UInt8](d)[...]) }
+        }
         bridge.onInput = { [weak ssh] d in ssh?.send(d) }
         bridge.onResize = { [weak ssh] c, r in ssh?.resize(cols: c, rows: r) }
-        DispatchQueue.main.async { let d = v.getTerminal().getDims(); ssh.resize(cols: d.cols, rows: d.rows) }
+        DispatchQueue.main.async {
+            let d = v.getTerminal().getDims()
+            ssh.resize(cols: d.cols, rows: d.rows)
+        }
         return v
     }
     func updateUIView(_ v: CustomTerminalView, context: Context) {
@@ -483,17 +501,15 @@ struct TerminalWrapper: UIViewRepresentable {
         if v.allowSystemKeyboard != want {
             v.allowSystemKeyboard = want
             if want {
-                // 切换到系统键盘：延迟一帧 becomeFirstResponder，避免在 updateUIView 里触发循环
-                DispatchQueue.main.async {
-                    if !v.isFirstResponder { _ = v.becomeFirstResponder() }
-                }
+                DispatchQueue.main.async { if !v.isFirstResponder { _ = v.becomeFirstResponder() } }
             }
         }
     }
 }
 
-// MARK: - 主界面
-struct RootView: View { var body: some View { NavigationStack { SessionListView() }.tint(Theme.blue) } }
+struct RootView: View {
+    var body: some View { NavigationStack { SessionListView() }.tint(Theme.blue) }
+}
 
 struct SessionListView: View {
     @EnvironmentObject var store: SessionStore
@@ -512,20 +528,36 @@ struct SessionListView: View {
                     }
                     Spacer()
                     Button { showShortcuts = true } label: {
-                        Image(systemName: "slider.horizontal.3").font(.system(size: 18, weight: .bold)).foregroundColor(Theme.blue).frame(width: 40, height: 40).background(Circle().fill(Theme.blueSoft))
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.system(size: 18, weight: .bold))
+                            .foregroundColor(Theme.blue)
+                            .frame(width: 40, height: 40)
+                            .background(Circle().fill(Theme.blueSoft))
                     }
                     Button { isNew = true; editing = Session(name: "", host: "", username: "") } label: {
-                        Image(systemName: "plus").font(.system(size: 18, weight: .bold)).foregroundColor(.black).frame(width: 40, height: 40).background(Circle().fill(Theme.blue))
+                        Image(systemName: "plus")
+                            .font(.system(size: 18, weight: .bold))
+                            .foregroundColor(.black)
+                            .frame(width: 40, height: 40)
+                            .background(Circle().fill(Theme.blue))
                     }
                 }.padding()
-                if store.sessions.isEmpty { Spacer(); Text("还没有会话").foregroundColor(Theme.textDim); Spacer() }
-                else {
+                if store.sessions.isEmpty {
+                    Spacer()
+                    Text("还没有会话").foregroundColor(Theme.textDim)
+                    Spacer()
+                } else {
                     ScrollView {
                         LazyVStack(spacing: 10) {
                             ForEach(store.sessions) { s in
                                 NavigationLink { TerminalScreen(session: s) } label: {
-                                    HStack { Text(s.shortName).font(.headline).foregroundColor(Theme.text); Spacer(); Text(s.displayHost).font(.caption).foregroundColor(Theme.textDim) }
-                                        .padding().background(RoundedRectangle(cornerRadius: 12).fill(Theme.bgElev))
+                                    HStack {
+                                        Text(s.shortName).font(.headline).foregroundColor(Theme.text)
+                                        Spacer()
+                                        Text(s.displayHost).font(.caption).foregroundColor(Theme.textDim)
+                                    }
+                                    .padding()
+                                    .background(RoundedRectangle(cornerRadius: 12).fill(Theme.bgElev))
                                 }
                                 .contextMenu {
                                     Button { isNew = false; editing = s } label: { Label("编辑", systemImage: "square.and.pencil") }
@@ -545,24 +577,36 @@ struct SessionListView: View {
 struct ShortcutEditView: View {
     @EnvironmentObject var store: ShortcutStore
     @Environment(\.dismiss) var dismiss
-    @State var newName = ""; @State var newCmd = ""
+    @State var newName = ""
+    @State var newCmd = ""
     var body: some View {
         NavigationStack {
             List {
                 Section("添加快捷指令") {
-                    TextField("名称", text: $newName); TextField("命令", text: $newCmd)
-                    Button("添加") { guard !newName.isEmpty, !newCmd.isEmpty else { return }; store.add(Shortcut(name: newName, command: newCmd)); newName=""; newCmd="" }
+                    TextField("名称", text: $newName)
+                    TextField("命令", text: $newCmd)
+                    Button("添加") {
+                        guard !newName.isEmpty, !newCmd.isEmpty else { return }
+                        store.add(Shortcut(name: newName, command: newCmd))
+                        newName = ""
+                        newCmd = ""
+                    }
                 }
                 Section("已保存") {
                     ForEach(store.shortcuts) { s in
                         HStack {
-                            VStack(alignment: .leading) { Text(s.name).font(.headline); Text(s.command).font(.caption).foregroundColor(.gray) }
+                            VStack(alignment: .leading) {
+                                Text(s.name).font(.headline)
+                                Text(s.command).font(.caption).foregroundColor(.gray)
+                            }
                             Spacer()
                             Button(role: .destructive) { store.delete(s) } label: { Image(systemName: "trash") }
                         }
                     }
                 }
-            }.navigationTitle("快捷指令管理").toolbar { Button("关闭") { dismiss() } }
+            }
+            .navigationTitle("快捷指令管理")
+            .toolbar { Button("关闭") { dismiss() } }
         }
     }
 }
@@ -576,19 +620,25 @@ struct SessionEditView: View {
     var body: some View {
         NavigationStack {
             Form {
-                TextField("名称", text: $session.name); TextField("主机", text: $session.host)
-                TextField("端口", value: $session.port, format: .number); TextField("用户名", text: $session.username)
+                TextField("名称", text: $session.name)
+                TextField("主机", text: $session.host)
+                TextField("端口", value: $session.port, format: .number)
+                TextField("用户名", text: $session.username)
                 SecureField("密码", text: $password)
                 Button("保存") {
                     if session.name.isEmpty { session.name = session.host }
-                    store.upsert(session); store.setPassword(password, for: session); dismiss()
+                    store.upsert(session)
+                    store.setPassword(password, for: session)
+                    dismiss()
                 }
-            }.navigationTitle(isNew ? "新建" : "编辑").toolbar { Button("取消") { dismiss() } }
-        }.onAppear { password = store.password(for: session) }
+            }
+            .navigationTitle(isNew ? "新建" : "编辑")
+            .toolbar { Button("取消") { dismiss() } }
+        }
+        .onAppear { password = store.password(for: session) }
     }
 }
 
-// MARK: - 终端页面
 struct TerminalScreen: View {
     let session: Session
     @EnvironmentObject var shortcutStore: ShortcutStore
@@ -599,7 +649,10 @@ struct TerminalScreen: View {
     @State private var showShortcuts = false
     @State private var keyboardMode: KeyboardMode = .custom
 
-    init(session: Session) { self.session = session; _ssh = StateObject(wrappedValue: SSHManager.shared.service(for: session)) }
+    init(session: Session) {
+        self.session = session
+        _ssh = StateObject(wrappedValue: SSHManager.shared.service(for: session))
+    }
 
     var body: some View {
         ZStack {
@@ -607,7 +660,11 @@ struct TerminalScreen: View {
             VStack(spacing: 0) {
                 HStack {
                     Button { dismiss() } label: {
-                        Image(systemName: "chevron.left").font(.system(size: 16, weight: .bold)).foregroundColor(Theme.blue).padding(8).background(Circle().fill(Theme.blueSoft))
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 16, weight: .bold))
+                            .foregroundColor(Theme.blue)
+                            .padding(8)
+                            .background(Circle().fill(Theme.blueSoft))
                     }
                     Circle().fill(ssh.isConnected ? Color.green : Theme.red).frame(width: 8, height: 8)
                     VStack(alignment: .leading, spacing: 2) {
@@ -615,33 +672,56 @@ struct TerminalScreen: View {
                         Text(ssh.statusText).font(.caption2.monospaced()).foregroundColor(Theme.textDim).lineLimit(1)
                     }
                     Spacer()
-                    Button { keyboardMode = .hidden } label: {
-                        Image(systemName: "keyboard.chevron.compact.down").font(.system(size: 15, weight: .semibold)).foregroundColor(Theme.blue).padding(8).background(Circle().fill(Theme.blueSoft))
+                    Button {
+                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                        keyboardMode = .hidden
+                    } label: {
+                        Image(systemName: "keyboard.chevron.compact.down")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(Theme.blue)
+                            .padding(8)
+                            .background(Circle().fill(Theme.blueSoft))
                     }
                     Button { showLog = true } label: {
-                        Image(systemName: "doc.text.magnifyingglass").font(.system(size: 15, weight: .semibold)).foregroundColor(Theme.blue).padding(8).background(Circle().fill(Theme.blueSoft))
+                        Image(systemName: "doc.text.magnifyingglass")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(Theme.blue)
+                            .padding(8)
+                            .background(Circle().fill(Theme.blueSoft))
                     }
-                }.padding(.horizontal, 12).padding(.vertical, 10).background(Color.black.opacity(0.8))
+                }
+                .padding(.horizontal, 12).padding(.vertical, 10)
+                .background(Color.black.opacity(0.8))
 
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         Button { showShortcuts = true } label: {
-                            Text("+ 添加").font(.system(.caption, design: .rounded).weight(.medium)).foregroundColor(Theme.blue)
-                                .padding(.horizontal, 12).padding(.vertical, 8).background(RoundedRectangle(cornerRadius: 8).fill(Theme.blueSoft))
+                            Text("+ 添加")
+                                .font(.system(.caption, design: .rounded).weight(.medium))
+                                .foregroundColor(Theme.blue)
+                                .padding(.horizontal, 12).padding(.vertical, 8)
+                                .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blueSoft))
                         }
                         ForEach(shortcutStore.shortcuts) { s in
                             Button { ssh.sendCommand(s.command) } label: {
-                                Text(s.name).font(.system(.caption, design: .rounded).weight(.medium)).foregroundColor(Theme.blue)
-                                    .padding(.horizontal, 12).padding(.vertical, 8).background(RoundedRectangle(cornerRadius: 8).fill(Theme.blueSoft))
+                                Text(s.name)
+                                    .font(.system(.caption, design: .rounded).weight(.medium))
+                                    .foregroundColor(Theme.blue)
+                                    .padding(.horizontal, 12).padding(.vertical, 8)
+                                    .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blueSoft))
                             }
                         }
-                    }.padding(.horizontal, 8).padding(.vertical, 6)
-                }.background(Color.black.opacity(0.5))
+                    }
+                    .padding(.horizontal, 8).padding(.vertical, 6)
+                }
+                .background(Color.black.opacity(0.5))
                 .sheet(isPresented: $showShortcuts) { ShortcutEditView().environmentObject(shortcutStore) }
 
                 ZStack {
                     TerminalWrapper(ssh: ssh, bridge: bridge, keyboardMode: $keyboardMode).background(Theme.bg)
-                    if keyboardMode == .hidden { Color.clear.contentShape(Rectangle()).onTapGesture { keyboardMode = .custom } }
+                    if keyboardMode == .hidden {
+                        Color.clear.contentShape(Rectangle()).onTapGesture { keyboardMode = .custom }
+                    }
                 }
 
                 if keyboardMode == .custom {
@@ -653,34 +733,58 @@ struct TerminalScreen: View {
                         onPaste: { if let s = UIPasteboard.general.string { ssh.appendInput(s) } },
                         onShortcut: { ssh.sendCommand($0) },
                         onEsc: { ssh.sendRawKey(0x1B) },
-                        onHide: { keyboardMode = .hidden },
+                        onHide: {
+                            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                            keyboardMode = .hidden
+                        },
                         onSwitchToSystem: { keyboardMode = .system }
                     )
                 } else {
-                    // .system 和 .hidden 都显示微缩工具条
                     HStack {
-                        Button { keyboardMode = .custom } label: {
-                            HStack(spacing: 4) { Image(systemName: "keyboard"); Text("微缩键盘") }
-                                .font(.system(size: 13, weight: .medium)).foregroundColor(Theme.blue)
-                                .padding(.horizontal, 12).padding(.vertical, 8).background(RoundedRectangle(cornerRadius: 8).fill(Theme.blueSoft))
+                        Button {
+                            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                            keyboardMode = .custom
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "keyboard")
+                                Text("微缩键盘")
+                            }
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundColor(Theme.blue)
+                            .padding(.horizontal, 12).padding(.vertical, 8)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blueSoft))
                         }
-                        Button { keyboardMode = .hidden } label: {
-                            HStack(spacing: 4) { Image(systemName: "keyboard.chevron.compact.down"); Text("收起") }
-                                .font(.system(size: 13, weight: .medium)).foregroundColor(Theme.orange)
-                                .padding(.horizontal, 12).padding(.vertical, 8).background(RoundedRectangle(cornerRadius: 8).fill(Theme.orange.opacity(0.2)))
+                        Button {
+                            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                            keyboardMode = .hidden
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "keyboard.chevron.compact.down")
+                                Text("收起")
+                            }
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundColor(Theme.orange)
+                            .padding(.horizontal, 12).padding(.vertical, 8)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Theme.orange.opacity(0.2)))
                         }
                         Spacer()
                         Text("已在线").font(.caption).foregroundColor(Theme.textDim)
                         Spacer()
                         Button { ssh.commitInput() } label: {
-                            Text("回车").font(.system(size: 14, weight: .bold)).foregroundColor(.white)
-                                .padding(.horizontal, 20).padding(.vertical, 8).background(RoundedRectangle(cornerRadius: 8).fill(Theme.blue))
+                            Text("回车")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 20).padding(.vertical, 8)
+                                .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blue))
                         }
-                    }.padding(.horizontal, 8).padding(.vertical, 6).background(Color.black.opacity(0.8))
+                    }
+                    .padding(.horizontal, 8).padding(.vertical, 6)
+                    .background(Color.black.opacity(0.8))
                 }
             }
         }
-        .navigationBarBackButtonHidden(true).toolbar(.hidden, for: .navigationBar)
+        .navigationBarBackButtonHidden(true)
+        .toolbar(.hidden, for: .navigationBar)
         .sheet(isPresented: $showLog) { CommandHistorySheet(records: ssh.commandHistory) }
         .task {
             let pw = KeychainHelper.read(account: "session.\(session.id.uuidString).password") ?? ""
@@ -689,7 +793,6 @@ struct TerminalScreen: View {
     }
 }
 
-// MARK: - 命令历史
 struct CommandHistorySheet: View {
     let records: [CommandRecord]
     @Environment(\.dismiss) private var dismiss
@@ -697,41 +800,62 @@ struct CommandHistorySheet: View {
         NavigationStack {
             ZStack {
                 Theme.bg.ignoresSafeArea()
-                if records.isEmpty { Text("还没有执行过命令").foregroundColor(Theme.textDim) }
-                else {
+                if records.isEmpty {
+                    Text("还没有执行过命令").foregroundColor(Theme.textDim)
+                } else {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 12) {
                             ForEach(records.reversed()) { rec in
                                 VStack(alignment: .leading, spacing: 8) {
                                     HStack {
-                                        Text("$ \(rec.command)").font(.caption).foregroundColor(Theme.textDim).lineLimit(1)
+                                        Text("$ \(rec.command)")
+                                            .font(.caption)
+                                            .foregroundColor(Theme.textDim)
+                                            .lineLimit(1)
                                         Spacer()
                                         Button {
                                             UIPasteboard.general.string = "$ \(rec.command)\n\(rec.output)"
                                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
                                         } label: {
-                                            HStack(spacing: 4) { Image(systemName: "doc.on.doc"); Text("整段") }
-                                                .font(.caption).foregroundColor(Theme.blue)
-                                                .padding(.horizontal, 8).padding(.vertical, 4).background(RoundedRectangle(cornerRadius: 6).fill(Theme.blueSoft))
+                                            HStack(spacing: 4) {
+                                                Image(systemName: "doc.on.doc")
+                                                Text("整段")
+                                            }
+                                            .font(.caption)
+                                            .foregroundColor(Theme.blue)
+                                            .padding(.horizontal, 8).padding(.vertical, 4)
+                                            .background(RoundedRectangle(cornerRadius: 6).fill(Theme.blueSoft))
                                         }
                                         Button {
                                             UIPasteboard.general.string = rec.output
                                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
                                         } label: {
-                                            HStack(spacing: 4) { Image(systemName: "doc.text"); Text("输出") }
-                                                .font(.caption).foregroundColor(Theme.blue)
-                                                .padding(.horizontal, 8).padding(.vertical, 4).background(RoundedRectangle(cornerRadius: 6).fill(Theme.blueSoft))
+                                            HStack(spacing: 4) {
+                                                Image(systemName: "doc.text")
+                                                Text("输出")
+                                            }
+                                            .font(.caption)
+                                            .foregroundColor(Theme.blue)
+                                            .padding(.horizontal, 8).padding(.vertical, 4)
+                                            .background(RoundedRectangle(cornerRadius: 6).fill(Theme.blueSoft))
                                         }
                                     }
-                                    Text(rec.output).font(.system(.footnote, design: .monospaced)).foregroundColor(Theme.text)
-                                        .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                                }.padding(12).background(RoundedRectangle(cornerRadius: 10).fill(Theme.bgElev))
+                                    Text(rec.output)
+                                        .font(.system(.footnote, design: .monospaced))
+                                        .foregroundColor(Theme.text)
+                                        .textSelection(.enabled)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .padding(12)
+                                .background(RoundedRectangle(cornerRadius: 10).fill(Theme.bgElev))
                             }
-                        }.padding(12)
+                        }
+                        .padding(12)
                     }
                 }
             }
-            .navigationTitle("命令历史").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("命令历史")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) { Button("关闭") { dismiss() } }
                 ToolbarItem(placement: .topBarTrailing) {
@@ -740,11 +864,11 @@ struct CommandHistorySheet: View {
                     }
                 }
             }
-        }.preferredColorScheme(.dark)
+        }
+        .preferredColorScheme(.dark)
     }
 }
 
-// MARK: - 自定义键盘
 struct CustomKeyPanel: View {
     let onInput: (String) -> Void
     let onBackspace: () -> Void
@@ -760,22 +884,38 @@ struct CustomKeyPanel: View {
         VStack(spacing: 4) {
             HStack(spacing: 6) {
                 Button { onHide() } label: {
-                    HStack(spacing: 4) { Image(systemName: "keyboard.chevron.compact.down"); Text("收起") }
-                        .font(.system(size: 13, weight: .medium)).foregroundColor(.white)
-                        .padding(.horizontal, 10).padding(.vertical, 6).background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.3)))
-                }.buttonStyle(.plain)
+                    HStack(spacing: 4) {
+                        Image(systemName: "keyboard.chevron.compact.down")
+                        Text("收起")
+                    }
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.3)))
+                }
+                .buttonStyle(.plain)
                 Button { onSwitchToSystem() } label: {
-                    HStack(spacing: 4) { Image(systemName: "keyboard"); Text("系统键盘") }
-                        .font(.system(size: 13, weight: .medium)).foregroundColor(Theme.orange)
-                        .padding(.horizontal, 10).padding(.vertical, 6).background(RoundedRectangle(cornerRadius: 6).fill(Theme.orange.opacity(0.2)))
-                }.buttonStyle(.plain)
+                    HStack(spacing: 4) {
+                        Image(systemName: "keyboard")
+                        Text("系统键盘")
+                    }
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(Theme.orange)
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Theme.orange.opacity(0.2)))
+                }
+                .buttonStyle(.plain)
                 Spacer()
                 Text("已连接").font(.system(size: 12, weight: .medium)).foregroundColor(Theme.green)
-            }.padding(.horizontal, 8).padding(.top, 6)
+            }
+            .padding(.horizontal, 8).padding(.top, 6)
 
             HStack(alignment: .top, spacing: 6) {
                 VStack(spacing: 4) {
-                    Text("已在线").font(.system(size: 12)).foregroundColor(Theme.textDim).frame(maxWidth: .infinity, alignment: .leading)
+                    Text("已在线")
+                        .font(.system(size: 12))
+                        .foregroundColor(Theme.textDim)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     HStack(spacing: 4) {
                         ForEach(["1","2","3","4","5","k"], id: \.self) { k in
                             Button { onInput(k) } label: { keyLabel(k) }.buttonStyle(.plain)
@@ -788,20 +928,36 @@ struct CustomKeyPanel: View {
                     }
                     HStack(spacing: 4) {
                         Button { onCtrlC() } label: {
-                            Text("Ctrl+C").font(.system(size: 12, weight: .medium)).foregroundColor(.white)
-                                .frame(maxWidth: .infinity).padding(.vertical, 8).background(RoundedRectangle(cornerRadius: 5).fill(Theme.red))
+                            Text("Ctrl+C")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
+                                .background(RoundedRectangle(cornerRadius: 5).fill(Theme.red))
                         }.buttonStyle(.plain)
                         Button { onEsc() } label: {
-                            Text("ESC").font(.system(size: 12, weight: .medium)).foregroundColor(.white)
-                                .frame(maxWidth: .infinity).padding(.vertical, 8).background(RoundedRectangle(cornerRadius: 5).fill(Theme.orange))
+                            Text("ESC")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
+                                .background(RoundedRectangle(cornerRadius: 5).fill(Theme.orange))
                         }.buttonStyle(.plain)
                         Button { onInput(" ") } label: {
-                            Text("空格").font(.system(size: 12, weight: .medium)).foregroundColor(.white)
-                                .frame(maxWidth: .infinity).padding(.vertical, 8).background(RoundedRectangle(cornerRadius: 5).fill(Color.gray.opacity(0.25)))
+                            Text("空格")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
+                                .background(RoundedRectangle(cornerRadius: 5).fill(Color.gray.opacity(0.25)))
                         }.buttonStyle(.plain)
                         Button { onBackspace() } label: {
-                            Image(systemName: "delete.left").font(.system(size: 14)).foregroundColor(.white)
-                                .frame(maxWidth: .infinity).padding(.vertical, 8).background(RoundedRectangle(cornerRadius: 5).fill(Color.gray.opacity(0.25)))
+                            Image(systemName: "delete.left")
+                                .font(.system(size: 14))
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 8)
+                                .background(RoundedRectangle(cornerRadius: 5).fill(Color.gray.opacity(0.25)))
                         }.buttonStyle(.plain)
                     }
                     HStack(spacing: 4) {
@@ -812,26 +968,46 @@ struct CustomKeyPanel: View {
                 }
                 VStack(spacing: 4) {
                     Button { onPaste() } label: {
-                        VStack(spacing: 4) { Image(systemName: "doc.on.clipboard"); Text("粘贴").font(.system(size: 12, weight: .medium)) }
-                            .foregroundColor(.white).frame(width: 80, height: 56).background(RoundedRectangle(cornerRadius: 8).fill(Theme.blue))
+                        VStack(spacing: 4) {
+                            Image(systemName: "doc.on.clipboard")
+                            Text("粘贴").font(.system(size: 12, weight: .medium))
+                        }
+                        .foregroundColor(.white)
+                        .frame(width: 80, height: 56)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blue))
                     }.buttonStyle(.plain)
                     Button { onEnter() } label: {
-                        VStack(spacing: 4) { Image(systemName: "return"); Text("回车").font(.system(size: 12, weight: .bold)) }
-                            .foregroundColor(.white).frame(width: 80, height: 56).background(RoundedRectangle(cornerRadius: 8).fill(Theme.blue))
+                        VStack(spacing: 4) {
+                            Image(systemName: "return")
+                            Text("回车").font(.system(size: 12, weight: .bold))
+                        }
+                        .foregroundColor(.white)
+                        .frame(width: 80, height: 56)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(Theme.blue))
                     }.buttonStyle(.plain)
                 }
-            }.padding(.horizontal, 8).padding(.bottom, 6)
+            }
+            .padding(.horizontal, 8).padding(.bottom, 6)
         }
         .background(Color(red: 0.06, green: 0.09, blue: 0.15))
         .overlay(Rectangle().frame(height: 1).foregroundColor(Theme.stroke), alignment: .top)
     }
+
     private func keyLabel(_ t: String) -> some View {
-        Text(t).font(.system(size: 14, weight: .medium)).foregroundColor(.white)
-            .frame(maxWidth: .infinity).padding(.vertical, 8).background(RoundedRectangle(cornerRadius: 5).fill(Color.gray.opacity(0.25)))
+        Text(t)
+            .font(.system(size: 14, weight: .medium))
+            .foregroundColor(.white)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 5).fill(Color.gray.opacity(0.25)))
     }
     private func customKeyLabel(_ t: String, color: Color) -> some View {
-        Text(t).font(.system(size: 12, weight: .medium)).foregroundColor(.white)
-            .frame(maxWidth: .infinity).padding(.vertical, 8).background(RoundedRectangle(cornerRadius: 5).fill(color))
+        Text(t)
+            .font(.system(size: 12, weight: .medium))
+            .foregroundColor(.white)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 5).fill(color))
     }
 }
 
@@ -842,7 +1018,10 @@ struct SSHBlackApp: App {
     init() { FontLoader.registerFonts() }
     var body: some Scene {
         WindowGroup {
-            RootView().environmentObject(store).environmentObject(shortcutStore).preferredColorScheme(.dark)
+            RootView()
+                .environmentObject(store)
+                .environmentObject(shortcutStore)
+                .preferredColorScheme(.dark)
         }
     }
 }
