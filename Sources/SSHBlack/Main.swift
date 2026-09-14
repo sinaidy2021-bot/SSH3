@@ -289,7 +289,7 @@ struct TerminalWrapper: UIViewRepresentable {
         v.nativeBackgroundColor = UIColor(Theme.bg)
         v.nativeForegroundColor = UIColor(Theme.text)
         
-        // 使用 Menlo 等宽字体，解决中文宽度和字体发虚问题
+        // 使用 Menlo 等宽字体，解决中文字体发虚和宽度问题
         v.font = UIFont(name: "Menlo", size: 14) ?? UIFont.monospacedSystemFont(ofSize: 14, weight: .regular)
         
         ssh.onData = { [weak v] d in
@@ -307,7 +307,7 @@ struct TerminalWrapper: UIViewRepresentable {
     }
     
     func updateUIView(_ v: TerminalView, context: Context) {
-        // 核心修复：当不是系统键盘模式时，强制让它交出第一响应者
+        // 终极修复：只要不是系统键盘模式，坚决交出焦点，杜绝系统键盘弹出
         if keyboardMode == .system {
             if !v.isFirstResponder {
                 v.becomeFirstResponder()
