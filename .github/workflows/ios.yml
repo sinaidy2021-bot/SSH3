@@ -8,73 +8,147 @@ jobs:
     runs-on: macos-15
 
     steps:
-      - uses: actions/checkout@v4
+      - name: 拉取代码
+        uses: actions/checkout@v4
 
       - name: 下载 Sarasa Mono SC（中英文等宽字体）
         run: |
           set -e
+
           mkdir -p Sources/SSHBlack/Fonts
-          echo "👉 安装 p7zip..."
+
+          echo "👉 安装 7-Zip..."
           brew install p7zip || brew install sevenzip
-          echo "👉 下载 Sarasa Mono SC 字体包..."
+
+          echo "👉 下载 Sarasa Mono SC..."
           curl -fL -o /tmp/sarasa.7z \
             "https://github.com/be5invis/Sarasa-Gothic/releases/download/v1.0.29/SarasaMonoSC-TTF-1.0.29.7z"
-          echo "👉 下载完成，大小："
-          ls -la /tmp/sarasa.7z
-          echo "👉 解压..."
+
+          echo "👉 解压字体..."
           7z x /tmp/sarasa.7z -o/tmp/sarasa/ -y > /dev/null
-          echo "👉 查找 Regular 字体文件..."
-          find /tmp/sarasa -name "SarasaMonoSC-Regular.ttf" -exec cp {} Sources/SSHBlack/Fonts/ \;
-          echo "👉 字体文件列表："
-          ls -la Sources/SSHBlack/Fonts/
-          if [ ! -f Sources/SSHBlack/Fonts/SarasaMonoSC-Regular.ttf ]; then
-            echo "❌ 字体文件未找到，列出解压目录内容排查："
-            find /tmp/sarasa -name "*.ttf" | head -n 20
+
+          echo "👉 查找 Regular 字体..."
+          FONT=$(find /tmp/sarasa -type f \
+            -name "SarasaMonoSC-Regular.ttf" | head -n 1)
+
+          if [ -z "$FONT" ]; then
+            echo "❌ 字体文件未找到"
+            echo "👉 当前找到的 TTF 文件："
+            find /tmp/sarasa -type f -name "*.ttf" | head -n 30
             exit 1
           fi
 
+          cp "$FONT" Sources/SSHBlack/Fonts/SarasaMonoSC-Regular.ttf
+
+          echo "✅ 字体安装完成："
+          ls -lh Sources/SSHBlack/Fonts/
+
       - name: 安装 XcodeGen
-        run: brew install xcodegen
+        run: |
+          brew install xcodegen
 
       - name: 生成 Xcode 工程
         run: |
+          set -e
+
           echo "👉 生成 Xcode 工程..."
           xcodegen generate
-          echo "✅ 生成完毕"
 
-      - name: 构建真机 IPA
+          echo "✅ Xcode 工程生成完成"
+          ls -la SSHBlack.xcodeproj
+
+      - name: 构建 iOS Release
         run: |
-          echo "👉 开始编译..."
           set +e
+
+          mkdir -p build
+
+          echo "========================================"
+          echo "👉 开始构建 iOS Release"
+          echo "========================================"
+
           xcodebuild archive \
             -project SSHBlack.xcodeproj \
             -scheme SSHBlack \
             -configuration Release \
             -destination 'generic/platform=iOS' \
-            -archivePath build/SSHBlack.xcarchive \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            -skipPackagePluginValidation -skipMacroValidation > build_log.txt 2>&1
-          CODE=$?
-          set -e
+            -archivePath "$PWD/build/SSHBlack.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            > "$PWD/build/build_log.txt" 2>&1
 
-          if [ $CODE -eq 0 ]; then
-            echo "🎉 编译成功"
-          else
+          CODE=$?
+
+          if [ $CODE -ne 0 ]; then
             echo "========================================"
-            echo "❌ 编译失败！以下是错误摘要（含上下文）"
+            echo "❌ 编译失败"
             echo "========================================"
-            grep -n -B 3 -A 3 "error:" build_log.txt | tail -n 120
-            echo "========================================"
+
+            grep -n -B 5 -A 8 "error:" build/build_log.txt | tail -n 200
+
+            echo ""
+            echo "👉 完整日志：build/build_log.txt"
+
+            exit $CODE
+          fi
+
+          echo "========================================"
+          echo "🎉 Xcode Archive 构建成功"
+          echo "========================================"
+
+          APP_PATH="build/SSHBlack.xcarchive/Products/Applications/SSHBlack.app"
+
+          if [ ! -d "$APP_PATH" ]; then
+            echo "❌ SSHBlack.app 不存在"
             exit 1
           fi
 
-          echo "✅ 打包 Payload..."
-          mkdir -p build/Payload
-          cp -R build/SSHBlack.xcarchive/Products/Applications/SSHBlack.app build/Payload/
-          cd build && zip -r SSHBlack-unsigned.ipa Payload
-          echo "🎉 IPA 打包完成"
+          echo "✅ 找到 App："
+          ls -lh "$APP_PATH"
 
-      - uses: actions/upload-artifact@v4
+          echo "========================================"
+          echo "👉 开始生成 IPA"
+          echo "========================================"
+
+          rm -rf build/Payload
+          rm -f build/SSHBlack-unsigned.ipa
+
+          mkdir -p build/Payload
+
+          cp -R "$APP_PATH" build/Payload/SSHBlack.app
+
+          cd build
+
+          zip -qry SSHBlack-unsigned.ipa Payload
+
+          cd ..
+
+          echo "========================================"
+          echo "🎉 IPA 生成成功"
+          echo "========================================"
+
+          ls -lh build/SSHBlack-unsigned.ipa
+
+          echo ""
+          echo "IPA 路径："
+          echo "$PWD/build/SSHBlack-unsigned.ipa"
+
+      - name: 上传 IPA
+        uses: actions/upload-artifact@v4
         with:
-          name: SSHBlack-未签名IPA
+          name: SSHBlack-IPA
           path: build/SSHBlack-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: 上传构建日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSHBlack-build-log
+          path: build/build_log.txt
+          if-no-files-found: ignore
+          retention-days: 7
