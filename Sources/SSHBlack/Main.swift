@@ -35,6 +35,7 @@ final class SSHSession: ObservableObject {
     var password: String = ""
 
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    private var connectionTask: Task<Void, Never>?
     private var writeChain: Task<Void, Never>?
 
     private var pendingOutput = ""
@@ -57,6 +58,15 @@ final class SSHSession: ObservableObject {
 
     private enum ANSIState { case normal, escape, csi, osc, oscEscape }
     private var ansiState: ANSIState = .normal
+
+    deinit {
+        connectionTask?.cancel()
+        writeChain?.cancel()
+        flushTask?.cancel()
+        if backgroundTask != .invalid {
+            UIApplication.shared.endBackgroundTask(backgroundTask)
+        }
+    }
 
     private func cleanANSI(_ raw: String) -> String {
         var result = ""
@@ -90,7 +100,7 @@ final class SSHSession: ObservableObject {
     }
 
     func connect() {
-        guard !isConnected else { return }
+        guard !isConnected, connectionTask == nil else { return }
 
         flushTask?.cancel()
         flushTask = nil
@@ -104,7 +114,10 @@ final class SSHSession: ObservableObject {
         ansiState = .normal
         commandEndMarker = "__MYSSH_DONE_\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))__"
 
-        Task {
+        connectionTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.connectionTask = nil }
+
             do {
                 let client = try await SSHClient.connect(
                     host: self.host,
@@ -433,9 +446,10 @@ final class SSHSession: ObservableObject {
 
         let previous = writeChain
 
-        let task = Task { [weak self] in
-            if let previous { await previous.value }
-            guard self != nil else { return }
+        let task = Task {
+            if let previous {
+                await previous.value
+            }
 
             do {
                 var buffer = ByteBufferAllocator().buffer(capacity: value.utf8.count)
@@ -474,6 +488,8 @@ final class SSHSession: ObservableObject {
     private func finishConnection(message: String?) {
         flushOutput()
 
+        let clientToClose = client
+        client = nil
         isConnected = false
         activeWriter = nil
         pendingCommands.removeAll()
@@ -487,11 +503,20 @@ final class SSHSession: ObservableObject {
                 output: message
             ))
         }
+
+        if let clientToClose {
+            Task {
+                try? await clientToClose.close()
+            }
+        }
     }
 
     func disconnect() {
         flushOutput()
         endBackgroundTask()
+
+        connectionTask?.cancel()
+        connectionTask = nil
 
         let clientToClose = client
         client = nil
@@ -740,13 +765,13 @@ struct TerminalView: View {
                         showMiniKeyboard = false
                         isSystemKeyboardFocused = false
                     }
-                    .onChange(of: session.history.count) { _ in
+                    .onChange(of: session.history.count) { _, _ in
                         scrollToBottom(proxy: proxy)
                     }
-                    .onChange(of: session.history.last?.output) { _ in
+                    .onChange(of: session.history.last?.output) { _, _ in
                         scrollToBottom(proxy: proxy)
                     }
-                    .onChange(of: session.shellPrompt) { _ in
+                    .onChange(of: session.shellPrompt) { _, _ in
                         scrollToBottom(proxy: proxy)
                     }
                 }
@@ -758,7 +783,7 @@ struct TerminalView: View {
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled(true)
                     .onSubmit { executeCurrentInput() }
-                    .onChange(of: isSystemKeyboardFocused) { focused in
+                    .onChange(of: isSystemKeyboardFocused) { _, focused in
                         if focused { showMiniKeyboard = false }
                     }
 
@@ -961,7 +986,7 @@ struct TerminalView: View {
             loadQuickCommands()
             if !session.isConnected { connectToServer() }
         }
-        .onChange(of: scenePhase) { phase in
+        .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .background: session.appDidEnterBackground()
             case .active: session.appWillEnterForeground()
