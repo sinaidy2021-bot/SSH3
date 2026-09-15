@@ -4,13 +4,12 @@ import Combine
 import Citadel
 import NIOCore
 import NIOSSH
+import SwiftUI
 
 public struct CommandHistoryItem: Identifiable {
     public let id: UUID
     public let command: String
     public var output: String
-
-    // 记录执行该命令时真实的 shell 提示符。
     public let prompt: String
 
     public init(command: String, output: String, prompt: String = "") {
@@ -21,13 +20,10 @@ public struct CommandHistoryItem: Identifiable {
     }
 }
 
-
 @MainActor
 final class SSHSession: ObservableObject {
     @Published var isConnected: Bool = false
     @Published var history: [CommandHistoryItem] = []
-
-    // 当前真实 shell 提示符，例如 root@vps:~#
     @Published private(set) var shellPrompt: String = ""
 
     private var client: SSHClient?
@@ -41,13 +37,9 @@ final class SSHSession: ObservableObject {
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var writeChain: Task<Void, Never>?
 
-    // MARK: - 输出批处理
-    // 大量输出时不要每个 SSH chunk 都触发 SwiftUI 重绘。
     private var pendingOutput = ""
     private var flushTask: Task<Void, Never>?
 
-    // MARK: - 多命令队列
-    // 每条命令单独保存，输出严格按发送顺序归属。
     private struct PendingCommand {
         let id: UUID
         let command: String
@@ -59,16 +51,10 @@ final class SSHSession: ObservableObject {
     private var markerBuffer = ""
     private var truncatedIDs = Set<UUID>()
 
-    // 终端中用 shell marker 判断一条命令何时结束。
     private var commandEndMarker = "__MYSSH_DONE_7F3A9C__"
-
-    // 防止单条命令超大输出拖垮 iPhone。
     private let maxOutputCharactersPerCommand = 300_000
-
-    // 防止长期使用后历史无限增长。
     private let maxHistoryItems = 120
 
-    // MARK: - ANSI 清理
     private enum ANSIState { case normal, escape, csi, osc, oscEscape }
     private var ansiState: ANSIState = .normal
 
@@ -103,7 +89,6 @@ final class SSHSession: ObservableObject {
         return result
     }
 
-    // MARK: - 连接
     func connect() {
         guard !isConnected else { return }
 
@@ -123,7 +108,7 @@ final class SSHSession: ObservableObject {
             do {
                 let client = try await SSHClient.connect(
                     host: self.host,
-                    port: .init(integerLiteral: self.port),
+                    port: self.port,
                     authenticationMethod: .passwordBased(
                         username: self.username,
                         password: self.password
@@ -146,18 +131,14 @@ final class SSHSession: ObservableObject {
                 )
 
                 try await client.withPTY(ptyReq) { [weak self] stream, writer in
-                    guard let self = self else { return }
-
+                    guard let self else { return }
                     self.activeWriter = writer
 
                     for try await event in stream {
                         let buffer: ByteBuffer
-
                         switch event {
-                        case .stdout(let b):
-                            buffer = b
-                        case .stderr(let b):
-                            buffer = b
+                        case .stdout(let b): buffer = b
+                        case .stderr(let b): buffer = b
                         }
 
                         if let text = buffer.getString(
@@ -174,33 +155,26 @@ final class SSHSession: ObservableObject {
                 }
             } catch {
                 self.finishConnection(
-                    message: "连接断开或异常: \(error.localizedDescription)"
+                    message: "è¿æ¥æ­å¼æå¼å¸¸: \(error.localizedDescription)"
                 )
             }
         }
     }
 
-    // MARK: - 输出接收/批处理
     private func receiveOutput(_ rawText: String) {
         let cleaned = cleanANSI(rawText)
         guard !cleaned.isEmpty else { return }
 
         pendingOutput.append(cleaned)
 
-        // 约 80ms 合并一次 UI 更新。
         if flushTask == nil {
             flushTask = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: 80_000_000)
-
                 guard !Task.isCancelled else { return }
-
-                await MainActor.run {
-                    self?.flushOutput()
-                }
+                self?.flushOutput()
             }
         }
 
-        // 极端大输出时不要让待处理缓冲无限涨。
         if pendingOutput.count >= 500_000 {
             flushOutput()
         }
@@ -209,18 +183,13 @@ final class SSHSession: ObservableObject {
     private func flushOutput() {
         flushTask?.cancel()
         flushTask = nil
-
         guard !pendingOutput.isEmpty else { return }
-
         let text = pendingOutput
         pendingOutput = ""
-
         processOutput(text)
     }
 
     private func processOutput(_ text: String) {
-        // x-ui / k 退出时，最后返回的提示符必须单独恢复，
-        // 不能被当成交互程序的输出。
         if let interactiveID = activeInteractiveID {
             let split = splitTrailingShellPrompt(text)
 
@@ -251,22 +220,16 @@ final class SSHSession: ObservableObject {
                 pendingCommands.removeFirst()
             }
 
-            // marker 后面的内容通常就是 shell 恢复出来的 prompt。
-            // 先保留，等完整 prompt 到齐后再解析。
             markerBuffer = String(markerBuffer[range.upperBound...])
         }
 
-        // 没有待完成命令时，只捕获真实 prompt。
-        // 这样首次登录、普通命令结束、x-ui 退出都能恢复命令符。
         if pendingCommands.isEmpty {
             let split = splitTrailingShellPrompt(markerBuffer)
-
             if let prompt = split.prompt {
                 shellPrompt = prompt
                 markerBuffer = split.body
             }
 
-            // 欢迎信息等不属于命令历史，避免重新出现在终端底部。
             if shellPrompt.isEmpty && markerBuffer.count > 512 {
                 markerBuffer = String(markerBuffer.suffix(256))
             }
@@ -295,7 +258,6 @@ final class SSHSession: ObservableObject {
         }
     }
 
-    // 从 SSH 输出尾部提取真实 shell prompt。
     private func splitTrailingShellPrompt(_ text: String) -> (body: String, prompt: String?) {
         let normalized = text
             .replacingOccurrences(of: "\r\n", with: "\n")
@@ -319,14 +281,9 @@ final class SSHSession: ObservableObject {
         }
 
         lines.remove(at: index)
-
-        let body = lines
-            .joined(separator: "\n")
-            .trimmingCharacters(in: .newlines)
-
+        let body = lines.joined(separator: "\n").trimmingCharacters(in: .newlines)
         return (body.isEmpty ? "" : body + "\n", candidate)
     }
-
 
     private func appendOutputToCurrentCommand(_ text: String) {
         guard let pending = pendingCommands.first, !text.isEmpty else { return }
@@ -334,38 +291,47 @@ final class SSHSession: ObservableObject {
     }
 
     private func appendOutput(_ text: String, to id: UUID, echoCommand: String? = nil) {
-        guard let index = history.firstIndex(where: { $0.id == id }), !truncatedIDs.contains(id) else { return }
+        guard let index = history.firstIndex(where: { $0.id == id }),
+              !truncatedIDs.contains(id) else { return }
+
         var output = history[index].output + text
+
         if let echoCommand {
-            if output.hasPrefix(echoCommand + "\n") { output.removeFirst(echoCommand.count + 1) }
-            else if output.hasPrefix(echoCommand) { output.removeFirst(echoCommand.count) }
+            if output.hasPrefix(echoCommand + "\n") {
+                output.removeFirst(echoCommand.count + 1)
+            } else if output.hasPrefix(echoCommand) {
+                output.removeFirst(echoCommand.count)
+            }
         }
+
         if output.count >= maxOutputCharactersPerCommand {
-            output = String(output.prefix(maxOutputCharactersPerCommand)) + "\n[输出过长，已限制显示]"
+            output = String(output.prefix(maxOutputCharactersPerCommand)) +
+                "\n[è¾åºè¿é¿ï¼å·²éå¶æ¾ç¤º]"
             truncatedIDs.insert(id)
         }
-        history[index].output = output
-    }
 
-    private func shellPromptAppeared(in text: String) -> Bool {
-        let line = text.split(separator: "\n", omittingEmptySubsequences: true).last.map(String.init) ?? text
-        let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        return t.range(of: #"^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+:.*[#$] ?$"#, options: .regularExpression) != nil
+        history[index].output = output
     }
 
     private func appendHistory(_ item: CommandHistoryItem) {
         history.append(item)
+
         while history.count > maxHistoryItems {
-            let protected = Set(pendingCommands.map { $0.id }).union(activeInteractiveID.map { [$0] } ?? [])
-            guard let index = history.firstIndex(where: { !protected.contains($0.id) }) else { break }
+            let protected = Set(pendingCommands.map(\.id))
+                .union(activeInteractiveID.map { Set([$0]) } ?? [])
+
+            guard let index = history.firstIndex(where: {
+                !protected.contains($0.id)
+            }) else { break }
+
             let removed = history.remove(at: index)
             truncatedIDs.remove(removed.id)
         }
     }
 
-    // MARK: - 发送命令
     func sendCommand(_ command: String) {
         guard isConnected else { return }
+
         let cmd = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cmd.isEmpty else { return }
 
@@ -380,21 +346,23 @@ final class SSHSession: ObservableObject {
             output: "",
             prompt: promptForCommand
         )
+
         appendHistory(item)
         pendingCommands.append(PendingCommand(id: item.id, command: cmd))
 
         enqueueWrite("\(cmd)\nprintf '\\n\(commandEndMarker)\\n'\n") { [weak self] error in
             guard let self else { return }
-            if let error { self.handleWriteFailure(id: item.id, error: error) }
+            if let error {
+                self.handleWriteFailure(id: item.id, error: error)
+            }
         }
     }
 
-
     func sendInteractiveCommand(_ command: String) {
         guard isConnected else { return }
+
         let cmd = command.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cmd.isEmpty else { return }
-        guard activeInteractiveID == nil else { return }
+        guard !cmd.isEmpty, activeInteractiveID == nil else { return }
 
         let promptForCommand = shellPrompt.isEmpty
             ? "\(username)@\(host):~#"
@@ -407,14 +375,17 @@ final class SSHSession: ObservableObject {
             output: "",
             prompt: promptForCommand
         )
+
         appendHistory(item)
         activeInteractiveID = item.id
         interactivePromptBuffer = ""
 
         enqueueWrite("\(cmd)\n") { [weak self] error in
             guard let self else { return }
+
             if let error {
                 self.handleWriteFailure(id: item.id, error: error)
+
                 if self.activeInteractiveID == item.id {
                     self.activeInteractiveID = nil
                     self.interactivePromptBuffer = ""
@@ -424,20 +395,19 @@ final class SSHSession: ObservableObject {
         }
     }
 
-
     private func handleWriteFailure(id: UUID, error: Error) {
         if let index = history.firstIndex(where: { $0.id == id }) {
-            history[index].output = "写入失败：\(error.localizedDescription)"
+            history[index].output = "åå¥å¤±è´¥ï¼\(error.localizedDescription)"
         }
+
         pendingCommands.removeAll { $0.id == id }
+
         if activeInteractiveID == id {
             activeInteractiveID = nil
             interactivePromptBuffer = ""
         }
     }
 
-    // MARK: - 控制键
-    // 控制键直接进入同一个串行写入队列，不创建命令历史。
     func sendControl(_ value: String) {
         guard isConnected else { return }
         enqueueWrite(value)
@@ -448,7 +418,6 @@ final class SSHSession: ObservableObject {
     func sendSpace() { sendControl(" ") }
     func sendBackspace() { sendControl("\u{7F}") }
 
-    // MARK: - 串行写入
     private func enqueueWrite(
         _ value: String,
         completion: ((Error?) -> Void)? = nil
@@ -457,15 +426,16 @@ final class SSHSession: ObservableObject {
             completion?(NSError(
                 domain: "MySSH",
                 code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "SSH 写入通道不存在"]
+                userInfo: [NSLocalizedDescriptionKey: "SSH åå¥ééä¸å­å¨"]
             ))
             return
         }
 
         let previous = writeChain
+
         let task = Task { [weak self] in
             if let previous { await previous.value }
-            guard let self else { return }
+            guard self != nil else { return }
 
             do {
                 var buffer = ByteBufferAllocator().buffer(capacity: value.utf8.count)
@@ -476,10 +446,10 @@ final class SSHSession: ObservableObject {
                 completion?(error)
             }
         }
+
         writeChain = task
     }
 
-    // MARK: - App 生命周期
     func appDidEnterBackground() {
         guard isConnected else { return }
 
@@ -501,7 +471,6 @@ final class SSHSession: ObservableObject {
         }
     }
 
-    // MARK: - 连接结束
     private func finishConnection(message: String?) {
         flushOutput()
 
@@ -513,9 +482,10 @@ final class SSHSession: ObservableObject {
         markerBuffer = ""
 
         if let message, !message.isEmpty {
-            appendHistory(
-                CommandHistoryItem(command: "system", output: message)
-            )
+            appendHistory(CommandHistoryItem(
+                command: "system",
+                output: message
+            ))
         }
     }
 
@@ -527,8 +497,10 @@ final class SSHSession: ObservableObject {
         client = nil
         activeWriter = nil
         isConnected = false
+
         writeChain?.cancel()
         writeChain = nil
+
         pendingCommands.removeAll()
         activeInteractiveID = nil
         interactivePromptBuffer = ""
@@ -541,12 +513,6 @@ final class SSHSession: ObservableObject {
         }
     }
 }
-
-
-// MARK: - TerminalView
-
-import SwiftUI
-import UIKit
 
 struct QuickCmd: Identifiable, Codable, Equatable {
     var id = UUID()
@@ -562,33 +528,27 @@ struct TerminalView: View {
     let password: String
 
     @StateObject private var session = SSHSession()
-    @State private var inputCommand: String = ""
+    @State private var inputCommand = ""
     @FocusState private var isSystemKeyboardFocused: Bool
-
-    @State private var showMiniKeyboard: Bool = false
+    @State private var showMiniKeyboard = false
     @Environment(\.scenePhase) private var scenePhase
-
     @State private var quickCommands: [QuickCmd] = []
     @State private var showingAddSheet = false
     @State private var newCmdName = ""
     @State private var newCmdContent = ""
-    @State private var copiedTip: String? = nil
-
+    @State private var copiedTip: String?
     private let storageKey = "SavedQuickCommands"
-
-    // 单个历史块最多渲染 400 行，避免超长输出拖慢 SwiftUI。
     private let maxRenderedLinesPerBlock = 400
 
     var body: some View {
         ZStack {
             VStack(spacing: 0) {
-                // MARK: - 快捷命令栏
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         Button(action: { showingAddSheet = true }) {
                             HStack(spacing: 3) {
                                 Image(systemName: "plus")
-                                Text("添加")
+                                Text("æ·»å ")
                             }
                             .font(.system(size: 11, weight: .bold))
                             .padding(.horizontal, 9)
@@ -601,7 +561,7 @@ struct TerminalView: View {
                         Button(action: { copyAllQuickCommands() }) {
                             HStack(spacing: 3) {
                                 Image(systemName: "doc.on.doc")
-                                Text("全复制")
+                                Text("å¨å¤å¶")
                             }
                             .font(.system(size: 11, weight: .bold))
                             .padding(.horizontal, 9)
@@ -613,7 +573,12 @@ struct TerminalView: View {
                         .disabled(quickCommands.isEmpty)
 
                         ForEach(quickCommands) { item in
-                            Button(action: { runCommand(item.cmd, interactive: isInteractiveCommand(item.cmd, name: item.name)) }) {
+                            Button(action: {
+                                runCommand(
+                                    item.cmd,
+                                    interactive: isInteractiveCommand(item.cmd, name: item.name)
+                                )
+                            }) {
                                 Text(item.name)
                                     .font(.system(size: 11, weight: .medium))
                                     .padding(.horizontal, 9)
@@ -624,21 +589,24 @@ struct TerminalView: View {
                             }
                             .contextMenu {
                                 Button {
-                                    copyBlock(item.cmd, tip: "已复制此命令")
+                                    copyBlock(item.cmd, tip: "å·²å¤å¶æ­¤å½ä»¤")
                                 } label: {
-                                    Label("复制此命令", systemImage: "doc.on.doc")
+                                    Label("å¤å¶æ­¤å½ä»¤", systemImage: "doc.on.doc")
                                 }
 
                                 Button {
-                                    runCommand(item.cmd, interactive: isInteractiveCommand(item.cmd, name: item.name))
+                                    runCommand(
+                                        item.cmd,
+                                        interactive: isInteractiveCommand(item.cmd, name: item.name)
+                                    )
                                 } label: {
-                                    Label("执行此命令", systemImage: "play.fill")
+                                    Label("æ§è¡æ­¤å½ä»¤", systemImage: "play.fill")
                                 }
 
                                 Button(role: .destructive) {
                                     deleteQuickCmd(item)
                                 } label: {
-                                    Label("删除快捷键", systemImage: "trash")
+                                    Label("å é¤å¿«æ·é®", systemImage: "trash")
                                 }
                             }
                         }
@@ -648,7 +616,6 @@ struct TerminalView: View {
                 }
                 .background(Color(white: 0.12))
 
-                // MARK: - 终端主体
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 14) {
@@ -656,14 +623,12 @@ struct TerminalView: View {
                                 VStack(alignment: .leading, spacing: 4) {
                                     if item.command == "system" {
                                         HStack {
-                                            Text("[系统状态]")
+                                            Text("[ç³»ç»ç¶æ]")
                                                 .font(.system(size: 11, weight: .bold, design: .monospaced))
                                                 .foregroundColor(.yellow.opacity(0.8))
-
                                             Spacer()
-
                                             Button(action: {
-                                                copyBlock(item.output, tip: "已复制系统信息")
+                                                copyBlock(item.output, tip: "å·²å¤å¶ç³»ç»ä¿¡æ¯")
                                             }) {
                                                 Image(systemName: "doc.on.doc")
                                                     .font(.system(size: 11))
@@ -674,20 +639,24 @@ struct TerminalView: View {
                                         renderOutputLines(item.output, defaultColor: .yellow)
                                     } else {
                                         HStack(alignment: .center) {
-                                            Text("\(item.prompt.isEmpty ? "\(username)@\(host):~#" : item.prompt) \(item.command)")
-                                                .font(.system(size: 13, weight: .bold, design: .monospaced))
-                                                .foregroundColor(.cyan)
-                                                .textSelection(.enabled)
+                                            Text(
+                                                "\(item.prompt.isEmpty ? "\(username)@\(host):~#" : item.prompt) \(item.command)"
+                                            )
+                                            .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                            .foregroundColor(.cyan)
+                                            .textSelection(.enabled)
 
                                             Spacer()
 
                                             Button(action: {
-                                                let fullBlock = commandBlock(for: item)
-                                                copyBlock(fullBlock, tip: "已复制整段命令与输出")
+                                                copyBlock(
+                                                    commandBlock(for: item),
+                                                    tip: "å·²å¤å¶æ´æ®µå½ä»¤ä¸è¾åº"
+                                                )
                                             }) {
                                                 HStack(spacing: 3) {
                                                     Image(systemName: "doc.on.doc")
-                                                    Text("复制整段")
+                                                    Text("å¤å¶æ´æ®µ")
                                                 }
                                                 .font(.system(size: 10, weight: .medium))
                                                 .foregroundColor(.gray)
@@ -703,14 +672,15 @@ struct TerminalView: View {
                                         if !item.output.isEmpty {
                                             HStack {
                                                 Spacer()
-
                                                 Button(action: {
-                                                    let fullBlock = commandBlock(for: item)
-                                                    copyBlock(fullBlock, tip: "已复制整段命令与输出")
+                                                    copyBlock(
+                                                        commandBlock(for: item),
+                                                        tip: "å·²å¤å¶æ´æ®µå½ä»¤ä¸è¾åº"
+                                                    )
                                                 }) {
                                                     HStack(spacing: 3) {
                                                         Image(systemName: "doc.on.doc")
-                                                        Text("复制整段")
+                                                        Text("å¤å¶æ´æ®µ")
                                                     }
                                                     .font(.system(size: 10, weight: .medium))
                                                     .foregroundColor(.gray)
@@ -729,16 +699,16 @@ struct TerminalView: View {
                                 .cornerRadius(6)
                                 .contextMenu {
                                     Button {
-                                        copyBlock(item.output, tip: "已复制本段输出")
+                                        copyBlock(item.output, tip: "å·²å¤å¶æ¬æ®µè¾åº")
                                     } label: {
-                                        Label("复制本段输出", systemImage: "doc.on.doc")
+                                        Label("å¤å¶æ¬æ®µè¾åº", systemImage: "doc.on.doc")
                                     }
 
                                     if item.command != "system" {
                                         Button {
-                                            copyBlock(item.command, tip: "已复制命令")
+                                            copyBlock(item.command, tip: "å·²å¤å¶å½ä»¤")
                                         } label: {
-                                            Label("仅复制命令", systemImage: "terminal")
+                                            Label("ä»å¤å¶å½ä»¤", systemImage: "terminal")
                                         }
                                     }
                                 }
@@ -781,29 +751,23 @@ struct TerminalView: View {
                     }
                 }
 
-                // MARK: - 系统键盘隐式输入框
                 TextField("", text: $inputCommand)
                     .focused($isSystemKeyboardFocused)
                     .frame(width: 0, height: 0)
                     .opacity(0)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-                    .onSubmit {
-                        executeCurrentInput()
-                    }
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .onSubmit { executeCurrentInput() }
                     .onChange(of: isSystemKeyboardFocused) { focused in
-                        if focused {
-                            showMiniKeyboard = false
-                        }
+                        if focused { showMiniKeyboard = false }
                     }
 
-                // MARK: - 微型键盘
                 VStack(spacing: 6) {
                     HStack(spacing: 8) {
                         Button(action: { toggleMiniKeyboard() }) {
                             HStack(spacing: 4) {
                                 Image(systemName: showMiniKeyboard ? "chevron.down" : "keyboard")
-                                Text(showMiniKeyboard ? "收起" : "微型键盘")
+                                Text(showMiniKeyboard ? "æ¶èµ·" : "å¾®åé®ç")
                             }
                             .font(.system(size: 12, weight: .bold))
                             .foregroundColor(.cyan)
@@ -816,7 +780,7 @@ struct TerminalView: View {
                         Button(action: { toggleSystemKeyboard() }) {
                             HStack(spacing: 4) {
                                 Image(systemName: isSystemKeyboardFocused ? "chevron.down" : "character.cursor.ibeam")
-                                Text(isSystemKeyboardFocused ? "收起" : "系统键盘")
+                                Text(isSystemKeyboardFocused ? "æ¶èµ·" : "ç³»ç»é®ç")
                             }
                             .font(.system(size: 12, weight: .bold))
                             .foregroundColor(.orange)
@@ -828,7 +792,7 @@ struct TerminalView: View {
 
                         Spacer()
 
-                        Text(session.isConnected ? "已连接" : "未连接")
+                        Text(session.isConnected ? "å·²è¿æ¥" : "æªè¿æ¥")
                             .font(.system(size: 12, weight: .bold))
                             .foregroundColor(session.isConnected ? .green : .red)
                             .padding(.horizontal, 8)
@@ -837,13 +801,15 @@ struct TerminalView: View {
                     .padding(.top, 6)
 
                     HStack(spacing: 8) {
-                        Text(inputCommand.isEmpty
-                             ? (session.isConnected ? "已在线" : "未连接")
-                             : inputCommand)
-                            .font(.system(size: 13, design: .monospaced))
-                            .foregroundColor(inputCommand.isEmpty ? .gray : .green)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .lineLimit(1)
+                        Text(
+                            inputCommand.isEmpty
+                                ? (session.isConnected ? "å·²å¨çº¿" : "æªè¿æ¥")
+                                : inputCommand
+                        )
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundColor(inputCommand.isEmpty ? .gray : .green)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .lineLimit(1)
 
                         if !inputCommand.isEmpty {
                             Button(action: { inputCommand = "" }) {
@@ -859,51 +825,29 @@ struct TerminalView: View {
                         HStack(alignment: .top, spacing: 6) {
                             VStack(spacing: 6) {
                                 HStack(spacing: 5) {
-                                    miniKey("1")
-                                    miniKey("2")
-                                    miniKey("3")
-                                    miniKey("4")
-                                    miniKey("5")
-                                    miniKey("k")
+                                    miniKey("1"); miniKey("2"); miniKey("3")
+                                    miniKey("4"); miniKey("5"); miniKey("k")
                                 }
 
                                 HStack(spacing: 5) {
-                                    miniKey("6")
-                                    miniKey("7")
-                                    miniKey("8")
-                                    miniKey("9")
-                                    miniKey("0")
-                                    miniKey("-")
+                                    miniKey("6"); miniKey("7"); miniKey("8")
+                                    miniKey("9"); miniKey("0"); miniKey("-")
                                 }
 
                                 HStack(spacing: 5) {
-                                    miniKey("Ctrl+C", color: .red) {
-                                        session.sendCtrlC()
-                                    }
-
-                                    miniKey("ESC", color: .orange) {
-                                        session.sendEscape()
-                                    }
-
-                                    miniKey("空格") {
-                                        inputCommand.append(" ")
-                                    }
-
-                                    miniKey("退格", icon: "delete.left") {
-                                        if !inputCommand.isEmpty {
-                                            inputCommand.removeLast()
-                                        }
+                                    miniKey("Ctrl+C", color: .red) { session.sendCtrlC() }
+                                    miniKey("ESC", color: .orange) { session.sendEscape() }
+                                    miniKey("ç©ºæ ¼") { inputCommand.append(" ") }
+                                    miniKey("éæ ¼", icon: "delete.left") {
+                                        if !inputCommand.isEmpty { inputCommand.removeLast() }
                                     }
                                 }
 
-                                // 原来的 88 已删除。
-                                // x-ui + q退出自动占满整行。
                                 HStack(spacing: 5) {
                                     miniKey("x-ui") {
                                         runCommand("x-ui", interactive: true)
                                     }
-
-                                    miniKey("q退出", color: .purple) {
+                                    miniKey("qéåº", color: .purple) {
                                         session.sendControl("q")
                                     }
                                 }
@@ -913,16 +857,15 @@ struct TerminalView: View {
                                 Button(action: {
                                     if let pasteString = UIPasteboard.general.string {
                                         inputCommand.append(pasteString)
-                                        showToast("已粘贴剪贴板内容")
+                                        showToast("å·²ç²è´´åªè´´æ¿åå®¹")
                                     } else {
-                                        showToast("剪贴板为空")
+                                        showToast("åªè´´æ¿ä¸ºç©º")
                                     }
                                 }) {
                                     VStack(spacing: 2) {
                                         Image(systemName: "doc.on.clipboard")
                                             .font(.system(size: 15))
-
-                                        Text("粘贴")
+                                        Text("ç²è´´")
                                             .font(.system(size: 12, weight: .semibold))
                                     }
                                     .frame(maxWidth: .infinity)
@@ -932,14 +875,11 @@ struct TerminalView: View {
                                     .cornerRadius(8)
                                 }
 
-                                Button(action: {
-                                    executeCurrentInput()
-                                }) {
+                                Button(action: { executeCurrentInput() }) {
                                     VStack(spacing: 4) {
                                         Image(systemName: "return")
                                             .font(.system(size: 20, weight: .bold))
-
-                                        Text("回车")
+                                        Text("åè½¦")
                                             .font(.system(size: 14, weight: .bold))
                                     }
                                     .frame(maxWidth: .infinity)
@@ -962,7 +902,6 @@ struct TerminalView: View {
             if let tip = copiedTip {
                 VStack {
                     Spacer()
-
                     Text(tip)
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(.white)
@@ -979,7 +918,7 @@ struct TerminalView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
-                Button(session.isConnected ? "断开" : "连接") {
+                Button(session.isConnected ? "æ­å¼" : "è¿æ¥") {
                     if session.isConnected {
                         session.disconnect()
                     } else {
@@ -991,31 +930,22 @@ struct TerminalView: View {
         .sheet(isPresented: $showingAddSheet) {
             NavigationView {
                 Form {
-                    Section(header: Text("快捷键属性")) {
-                        TextField(
-                            "按键名称 (例如: 3x-ui / x-ui)",
-                            text: $newCmdName
-                        )
-
-                        TextField(
-                            "执行命令 (例如: x-ui)",
-                            text: $newCmdContent
-                        )
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
+                    Section(header: Text("å¿«æ·é®å±æ§")) {
+                        TextField("æé®åç§° (ä¾å¦: 3x-ui / x-ui)", text: $newCmdName)
+                        TextField("æ§è¡å½ä»¤ (ä¾å¦: x-ui)", text: $newCmdContent)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled(true)
                     }
                 }
-                .navigationTitle("添加快捷键")
+                .navigationTitle("æ·»å å¿«æ·é®")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
-                        Button("取消") {
-                            showingAddSheet = false
-                        }
+                        Button("åæ¶") { showingAddSheet = false }
                     }
 
                     ToolbarItem(placement: .confirmationAction) {
-                        Button("保存") {
+                        Button("ä¿å­") {
                             addQuickCmd()
                             showingAddSheet = false
                         }
@@ -1029,24 +959,17 @@ struct TerminalView: View {
         }
         .onAppear {
             loadQuickCommands()
-
-            if !session.isConnected {
-                connectToServer()
-            }
+            if !session.isConnected { connectToServer() }
         }
         .onChange(of: scenePhase) { phase in
             switch phase {
-            case .background:
-                session.appDidEnterBackground()
-            case .active:
-                session.appWillEnterForeground()
-            default:
-                break
+            case .background: session.appDidEnterBackground()
+            case .active: session.appWillEnterForeground()
+            default: break
             }
         }
     }
 
-    // MARK: - 复制
     private func copyBlock(_ text: String, tip: String) {
         let cleaned = stripANSIEscapeCodes(text)
             .replacingOccurrences(of: "\r\n", with: "\n")
@@ -1054,7 +977,7 @@ struct TerminalView: View {
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard !cleaned.isEmpty else {
-            showToast("没有可复制的内容")
+            showToast("æ²¡æå¯å¤å¶çåå®¹")
             return
         }
 
@@ -1063,9 +986,7 @@ struct TerminalView: View {
     }
 
     private func commandBlock(for item: CommandHistoryItem) -> String {
-        let prompt = item.prompt.isEmpty
-            ? "\(username)@\(host):~#"
-            : item.prompt
+        let prompt = item.prompt.isEmpty ? "\(username)@\(host):~#" : item.prompt
 
         let output = stripANSIEscapeCodes(item.output)
             .replacingOccurrences(of: "\r\n", with: "\n")
@@ -1079,7 +1000,6 @@ struct TerminalView: View {
         return "\(prompt) \(item.command)\n\(output)"
     }
 
-    // MARK: - ANSI
     private func stripANSIEscapeCodes(_ text: String) -> String {
         let pattern =
             "\u{1B}(\\[[0-9;?]*[ -/]*[@-~]|\\][^\u{07}]*\u{07}|[()][A-Za-z0-9]|[@-Z\\\\^_])"
@@ -1113,10 +1033,12 @@ struct TerminalView: View {
 
         LazyVStack(alignment: .leading, spacing: 2) {
             if isTruncated {
-                Text("⚠️ 输出过长（共 \(allLines.count) 行），仅显示最后 \(maxRenderedLinesPerBlock) 行。点击"复制整段"可获取已接收内容。")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(.orange)
-                    .padding(.bottom, 2)
+                Text(
+                    "â ï¸ è¾åºè¿é¿ï¼å± \(allLines.count) è¡ï¼ï¼ä»æ¾ç¤ºæå \(maxRenderedLinesPerBlock) è¡ãç¹å»âå¤å¶æ´æ®µâå¯è·åå·²æ¥æ¶åå®¹ã"
+                )
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.orange)
+                .padding(.bottom, 2)
             }
 
             ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
@@ -1138,15 +1060,12 @@ struct TerminalView: View {
                             .font(.system(size: 13, design: .monospaced))
                             .foregroundColor(defaultColor)
                             .textSelection(.enabled)
-                            .frame(
-                                maxWidth: .infinity,
-                                alignment: .leading
-                            )
+                            .frame(maxWidth: .infinity, alignment: .leading)
 
                         Button {
                             if let value = copyValue {
                                 UIPasteboard.general.string = value
-                                showToast("已复制: \(value)")
+                                showToast("å·²å¤å¶: \(value)")
                             }
                         } label: {
                             Image(systemName: "doc.on.doc")
@@ -1169,15 +1088,10 @@ struct TerminalView: View {
     }
 
     private func copyValueForOutputLine(_ line: String) -> String? {
-        let trimmed =
-            line.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
 
-        guard !trimmed.isEmpty else {
-            return nil
-        }
-
-        if trimmed.hasPrefix("http://") ||
-            trimmed.hasPrefix("https://") {
+        if trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://") {
             return trimmed
         }
 
@@ -1186,18 +1100,15 @@ struct TerminalView: View {
         }
 
         let prefix = trimmed[..<colon]
-
         if prefix == "http" || prefix == "https" {
             return trimmed
         }
 
         let valueStart = trimmed.index(after: colon)
-
         return String(trimmed[valueStart...])
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    // MARK: - 键盘
     private func toggleMiniKeyboard() {
         withAnimation(.easeInOut(duration: 0.2)) {
             if showMiniKeyboard {
@@ -1221,14 +1132,10 @@ struct TerminalView: View {
     }
 
     private func showToast(_ msg: String) {
-        withAnimation {
-            copiedTip = msg
-        }
+        withAnimation { copiedTip = msg }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
-            withAnimation {
-                copiedTip = nil
-            }
+            withAnimation { copiedTip = nil }
         }
     }
 
@@ -1239,26 +1146,20 @@ struct TerminalView: View {
         action: (() -> Void)? = nil
     ) -> some View {
         Button(action: {
-            if let action = action {
+            if let action {
                 action()
             } else {
                 inputCommand.append(label)
             }
         }) {
             HStack(spacing: 2) {
-                if let icon = icon {
+                if let icon {
                     Image(systemName: icon)
                         .font(.system(size: 11))
                 }
 
                 Text(label)
-                    .font(
-                        .system(
-                            size: 13,
-                            weight: .medium,
-                            design: .monospaced
-                        )
-                    )
+                    .font(.system(size: 13, weight: .medium, design: .monospaced))
             }
             .frame(maxWidth: .infinity)
             .frame(height: 36)
@@ -1268,14 +1169,12 @@ struct TerminalView: View {
         }
     }
 
-    // MARK: - 滚动
     private func scrollToBottom(proxy: ScrollViewProxy) {
         DispatchQueue.main.async {
             proxy.scrollTo("BOTTOM_ANCHOR", anchor: .bottom)
         }
     }
 
-    // MARK: - SSH
     private func connectToServer() {
         session.host = host
         session.port = port
@@ -1285,14 +1184,8 @@ struct TerminalView: View {
     }
 
     private func executeCurrentInput() {
-        let cmd =
-            inputCommand.trimmingCharacters(
-                in: .whitespacesAndNewlines
-            )
-
-        guard !cmd.isEmpty else {
-            return
-        }
+        let cmd = inputCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cmd.isEmpty else { return }
 
         runCommand(cmd)
         inputCommand = ""
@@ -1301,6 +1194,7 @@ struct TerminalView: View {
     private func runCommand(_ cmd: String, interactive: Bool = false) {
         let trimmed = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+
         if interactive || isInteractiveCommand(trimmed, name: nil) {
             session.sendInteractiveCommand(trimmed)
         } else {
@@ -1310,65 +1204,57 @@ struct TerminalView: View {
 
     private func isInteractiveCommand(_ cmd: String, name: String?) -> Bool {
         let value = cmd.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if value == "x-ui" || value == "k" { return true }
+
+        if value == "x-ui" || value == "k" {
+            return true
+        }
+
         if let name {
             let n = name.lowercased()
-            if n.contains("x-ui") || (n.contains("k") && n.contains("菜单")) { return true }
+            if n.contains("x-ui") || (n.contains("k") && n.contains("èå")) {
+                return true
+            }
         }
+
         return false
     }
 
-    // MARK: - 快捷命令
     private func loadQuickCommands() {
-        if let data = UserDefaults.standard.data(
-            forKey: storageKey
-        ),
-        let decoded = try? JSONDecoder().decode(
-            [QuickCmd].self,
-            from: data
-        ) {
+        if let data = UserDefaults.standard.data(forKey: storageKey),
+           let decoded = try? JSONDecoder().decode([QuickCmd].self, from: data) {
             quickCommands = decoded
         } else {
             quickCommands = [
-                QuickCmd(name: "输入 k 菜单", cmd: "k"),
-                QuickCmd(name: "面板管理 (x-ui)", cmd: "x-ui"),
-                QuickCmd(name: "查看文件 (ls)", cmd: "ls -la"),
-                QuickCmd(name: "磁盘空间 (df)", cmd: "df -h"),
-                QuickCmd(name: "系统信息 (uname)", cmd: "uname -a")
+                QuickCmd(name: "è¾å¥ k èå", cmd: "k"),
+                QuickCmd(name: "é¢æ¿ç®¡ç (x-ui)", cmd: "x-ui"),
+                QuickCmd(name: "æ¥çæä»¶ (ls)", cmd: "ls -la"),
+                QuickCmd(name: "ç£çç©ºé´ (df)", cmd: "df -h"),
+                QuickCmd(name: "ç³»ç»ä¿¡æ¯ (uname)", cmd: "uname -a")
             ]
-
             saveQuickCommands()
         }
     }
 
     private func copyAllQuickCommands() {
         guard !quickCommands.isEmpty else {
-            showToast("暂无快捷命令")
+            showToast("ææ å¿«æ·å½ä»¤")
             return
         }
 
-        let text = quickCommands.map { item in
-            "\(item.name) = \(item.cmd)"
-        }.joined(separator: "\n")
+        let text = quickCommands
+            .map { "\($0.name) = \($0.cmd)" }
+            .joined(separator: "\n")
 
-        copyBlock(text, tip: "已复制全部快捷命令")
+        copyBlock(text, tip: "å·²å¤å¶å¨é¨å¿«æ·å½ä»¤")
     }
 
     private func addQuickCmd() {
-        let name =
-            newCmdName.trimmingCharacters(in: .whitespaces)
+        let name = newCmdName.trimmingCharacters(in: .whitespaces)
+        let cmd = newCmdContent.trimmingCharacters(in: .whitespaces)
 
-        let cmd =
-            newCmdContent.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty, !cmd.isEmpty else { return }
 
-        guard !name.isEmpty, !cmd.isEmpty else {
-            return
-        }
-
-        quickCommands.append(
-            QuickCmd(name: name, cmd: cmd)
-        )
-
+        quickCommands.append(QuickCmd(name: name, cmd: cmd))
         saveQuickCommands()
 
         newCmdName = ""
@@ -1376,29 +1262,18 @@ struct TerminalView: View {
     }
 
     private func deleteQuickCmd(_ item: QuickCmd) {
-        quickCommands.removeAll {
-            $0.id == item.id
-        }
-
+        quickCommands.removeAll { $0.id == item.id }
         saveQuickCommands()
     }
 
     private func saveQuickCommands() {
-        if let encoded = try? JSONEncoder().encode(
-            quickCommands
-        ) {
-            UserDefaults.standard.set(
-                encoded,
-                forKey: storageKey
-            )
+        if let encoded = try? JSONEncoder().encode(quickCommands) {
+            UserDefaults.standard.set(encoded, forKey: storageKey)
         }
     }
 }
 
-
-// MARK: - App 入口
-// 之前 "_main" 链接错误的根本原因：项目里没有任何 @main 入口，
-// 导致编译器不知道程序从哪里启动。直接加在这里，不需要拆文件。
+// åæä»¶å¥å£ï¼æ¬æä»¶å¿é¡»æ¯ Target ä¸­å¯ä¸åå« @main ç Swift æä»¶ã
 @main
 struct SSHBlackApp: App {
     var body: some Scene {
@@ -1408,10 +1283,8 @@ struct SSHBlackApp: App {
     }
 }
 
-// 简易连接表单作为启动页。如果你已经有自己的服务器列表页面，
-// 把下面 body 里的 ServerConnectView() 换成你自己的根视图就行。
 struct ServerConnectView: View {
-    @State private var serverName = "服务器"
+    @State private var serverName = "æå¡å¨"
     @State private var host = ""
     @State private var port = "22"
     @State private var username = "root"
@@ -1419,39 +1292,43 @@ struct ServerConnectView: View {
     @State private var showTerminal = false
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             Form {
-                Section(header: Text("服务器信息")) {
-                    TextField("名称", text: $serverName)
-                    TextField("主机 / IP", text: $host)
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
-                    TextField("端口", text: $port)
+                Section("æå¡å¨ä¿¡æ¯") {
+                    TextField("åç§°", text: $serverName)
+
+                    TextField("ä¸»æº / IP", text: $host)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled(true)
+
+                    TextField("ç«¯å£", text: $port)
                         .keyboardType(.numberPad)
-                    TextField("用户名", text: $username)
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
-                    SecureField("密码", text: $password)
+
+                    TextField("ç¨æ·å", text: $username)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled(true)
+
+                    SecureField("å¯ç ", text: $password)
                 }
 
-                Button("连接") {
+                Button("è¿æ¥") {
                     showTerminal = true
                 }
-                .disabled(host.isEmpty || password.isEmpty)
+                .disabled(
+                    host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                    password.isEmpty
+                )
             }
             .navigationTitle("SSH Black")
-            .background(
-                NavigationLink(
-                    destination: TerminalView(
-                        serverName: serverName,
-                        host: host,
-                        port: Int(port) ?? 22,
-                        username: username,
-                        password: password
-                    ),
-                    isActive: $showTerminal
-                ) { EmptyView() }
-            )
+            .navigationDestination(isPresented: $showTerminal) {
+                TerminalView(
+                    serverName: serverName,
+                    host: host,
+                    port: Int(port) ?? 22,
+                    username: username,
+                    password: password
+                )
+            }
         }
     }
 }
